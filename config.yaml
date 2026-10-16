@@ -1,0 +1,27 @@
+# ==============================================================================
+# LDSC & Epigenetic Pipeline Configuration (VIBRA HPC Defaults)
+# ==============================================================================
+
+# Slurm Cluster Defaults
+slurm_partition: "irbio01"
+
+# Shell Environment & Conda Setup on Cluster
+use_conda_activation: true
+conda_sh: "/aplic/anaconda/2024.02/etc/profile.d/conda.sh"
+ldsc_env: "ldsc"
+snakemake_env: "snakemake_env"
+python_bin: "python"
+
+# LDSC Software & Script Paths (relative to project root)
+ldsc_script: "../ldsc/ldsc.py"
+munge_script: "../ldsc/munge_sumstats.py"
+
+# Reference Panels & LD Scores (relative to project root)
+snplist: "data/reference/w_hm3.snplist"
+ld_ref: "data/reference/LDscores"
+
+# Epigenetic Panels
+meth_types:
+  - "DNA_ASM"
+  - "RNA_m6A"
+

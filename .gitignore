@@ -1,0 +1,45 @@
+# Snakemake internal cache & metadata
+.snakemake/
+
+# VS Code settings
+.vscode/
+
+# Streamlit settings
+.streamlit/
+
+# Bash commands for running the pipeline
+bash_command.txt
+
+# Large input data and generated outputs
+data/
+results/
+logs/
+
+# Python cache & temporary files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Compressed archives & large tables (safety net)
+*.gz
+*.tar
+*.zip
+*.bgz
+*.bam
+*.bai
+*.vcf
+*.bed
+*.bim
+*.fam
+*.rds
+*.RData
+*.h5
+*.parquet
+*.feather
+*.ldscore
+
+# Allow small schema/header sample files if you create a 'schemas/' folder later
+!schemas/*.txt
+
+# Local machine-specific overrides (never commit to git/HPC)
+config_local.yaml

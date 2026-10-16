@@ -1,0 +1,45 @@
+# ==============================================================================
+# Snakemake 9 Slurm Profile for VIBRA HPC
+#
+# Usage:
+#   snakemake --profile profiles/slurm all
+#   snakemake --profile profiles/slurm methylation
+# ==============================================================================
+
+executor: slurm
+jobs: 5
+latency-wait: 60
+printshellcmds: true
+
+default-resources:
+  slurm_partition: "irbio01"
+  runtime: 60
+  mem_mb: 4000
+  slurm_extra: "'--output=logs/%x_%j.out --error=logs/%x_%j.err'"
+
+set-resources:
+  munge_sumstats:
+    runtime: 360
+    mem_mb: 16000
+    slurm_partition: "irbio01"
+  ldsc_h2:
+    runtime: 60
+    mem_mb: 16000
+    slurm_partition: "irbio01"
+  ldsc_rg:
+    runtime: 120
+    mem_mb: 16000
+    slurm_partition: "irbio01"
+  plot_heatmap:
+    runtime: 30
+    mem_mb: 4000
+    slurm_partition: "irbio01"
+  plot_network:
+    runtime: 30
+    mem_mb: 4000
+    slurm_partition: "irbio01"
+  methylation_overlap:
+    runtime: 15
+    mem_mb: 4000
+    slurm_partition: "irbio01"
+
