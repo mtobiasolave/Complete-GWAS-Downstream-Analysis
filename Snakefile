@@ -16,8 +16,14 @@ if os.path.exists("config_local.yaml"):
     configfile: "config_local.yaml"
 
 # ----- TRAIT & PAIR DETECTION ----- #
-# 1. Automatically detect every trait in your raw_data folder
-TRAITS, = glob_wildcards("data/raw_data/{trait}_gwas.txt")
+# 1. Detect traits from config['traits'] (with automatic fallback to raw_data folder)
+DISCOVERED_TRAITS, = glob_wildcards("data/raw_data/{trait}_gwas.txt")
+TRAITS = config.get("traits", DISCOVERED_TRAITS) or DISCOVERED_TRAITS
+
+def get_gwas_input(wildcards):
+    """Resolve raw GWAS summary statistics path for {trait} from config or default pattern."""
+    gwas_map = config.get("gwas_sumstats", {})
+    return gwas_map.get(wildcards.trait, f"data/raw_data/{wildcards.trait}_gwas.txt")
 
 # 2. Automatically generate every unique pair (e.g., A_B, A_C, B_C)
 PAIRS = [f"{t1}_{t2}" for t1, t2 in itertools.combinations(TRAITS, 2)]
@@ -30,12 +36,30 @@ METH_TYPES = config.get("meth_types", ["DNA_ASM", "RNA_m6A"])
 # PIPELINE SHORTCUTS (DUMMY RULES)
 # ==========================================
 
-# 1. Run everything (Munge -> Correlations -> Plots)
+# 1. Run everything (Munge -> Correlations -> Plots + Per-Trait & Cross-Trait DNA ASM & RNA m6A Methylation)
 # Snakemake 9 Profile Command: snakemake --profile profiles/slurm all
 rule all:
     input:
         "results/figures/rg_heatmap.pdf",
-        "results/figures/rg_network.pdf"
+        "results/figures/rg_network.pdf",
+        expand(
+            "results/methylation/{meth}_{trait}_overlap.txt",
+            meth=METH_TYPES,
+            trait=TRAITS
+        ),
+        expand(
+            "results/methylation/{meth}_{trait}_overlap_fullheaders.txt",
+            meth=METH_TYPES,
+            trait=TRAITS
+        ),
+        expand("results/methylation/dna_asm_{trait}_cpg_gene_tss_matches.tsv", trait=TRAITS),
+        expand("results/methylation/dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv", trait=TRAITS),
+        expand("results/methylation/dna_asm_{trait}_concordant_genes_summary.tsv", trait=TRAITS),
+        "results/methylation/comparisons/cross_trait_asm_recurrent_snps.tsv",
+        "results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps.tsv",
+        "results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps_annotated.tsv",
+        "results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps_summary.tsv",
+        "results/figures/cross_trait_rna_m6a_recurrent_snps_annotated_effect_heatmap.pdf"
 
 # 2. Run correlations and stop (No plotting)
 # Snakemake 9 Profile Command: snakemake --profile profiles/slurm correlations
@@ -55,7 +79,7 @@ rule munge_only:
     input:
         expand("results/munged/{trait}.sumstats.gz", trait=TRAITS)
 
-# 5. Run methylation overlap analysis step only
+# 5. Run methylation overlap & functional convergence analysis step only (DNA ASM + RNA m6A)
 # Snakemake 9 Profile Command: snakemake --profile profiles/slurm --jobs 10 methylation
 rule methylation:
     input:
@@ -68,7 +92,24 @@ rule methylation:
             "results/methylation/{meth}_{trait}_overlap_fullheaders.txt",
             meth=METH_TYPES,
             trait=TRAITS
-        )
+        ),
+        expand(
+            "results/methylation/dna_asm_{trait}_cpg_gene_tss_matches.tsv",
+            trait=TRAITS
+        ),
+        expand(
+            "results/methylation/dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv",
+            trait=TRAITS
+        ),
+        expand(
+            "results/methylation/dna_asm_{trait}_concordant_genes_summary.tsv",
+            trait=TRAITS
+        ),
+        "results/methylation/comparisons/cross_trait_asm_recurrent_snps.tsv",
+        "results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps.tsv",
+        "results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps_annotated.tsv",
+        "results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps_summary.tsv",
+        "results/figures/cross_trait_rna_m6a_recurrent_snps_annotated_effect_heatmap.pdf"
 
 def get_col_flags(wildcards, input):
     """Reads the first line of the GWAS file and matches headers to LDSC flags."""
@@ -133,7 +174,7 @@ def get_python_bin():
 # ------------------------------------------------------------------------------
 rule munge_sumstats:
     input:
-        sumstats="data/raw_data/{trait}_gwas.txt",
+        sumstats=get_gwas_input,
         snplist=config.get("snplist", "data/reference/w_hm3.snplist")
     output:
         "results/munged/{trait}.sumstats.gz"
@@ -290,7 +331,7 @@ rule plot_network:
 # ------------------------------------------------------------------------------
 rule methylation_overlap:
     input:
-        gwas="data/raw_data/{trait}_gwas.txt",
+        gwas=get_gwas_input,
         snp_list="data/methylation/{meth}_SNPlist.txt"
     output:
         overlap_ids="results/methylation/{meth}_{trait}_overlap.txt",
@@ -310,4 +351,199 @@ rule methylation_overlap:
     shell:
         """
         {params.env_setup}{params.python_bin} scripts/overlap_methylation.py {input.snp_list} {input.gwas} {output.overlap_full} {output.overlap_ids}
+        """
+
+# ------------------------------------------------------------------------------
+# Step 5a: Intersect GWAS Summary Statistics with DNA ASM Tag SNPs & LD Proxies (Per-Trait)
+# ------------------------------------------------------------------------------
+rule overlap_dna_asm:
+    input:
+        gwas=get_gwas_input,
+        mapping_table=config["methylation"]["dna_mapping_table"]
+    output:
+        "results/methylation/dna_asm_{trait}_gwas_overlap.tsv"
+    params:
+        env_setup=lambda wildcards: get_env_setup("snakemake_env"),
+        python_bin=get_python_bin(),
+        partition=config.get("slurm_partition", "irbio01"),
+        time="00:15:00"
+    resources:
+        mem_mb=4000,
+        cpus=1,
+        runtime=15,
+        slurm_partition=config.get("slurm_partition", "irbio01"),
+        slurm_extra="'--output=logs/overlap_dna_asm_%j.out --error=logs/overlap_dna_asm_%j.err'"
+    shell:
+        """
+        {params.env_setup}{params.python_bin} scripts/overlap_dna_asm.py \
+            --mapping-table {input.mapping_table} \
+            --gwas {input.gwas} \
+            --output {output}
+        """
+
+# ------------------------------------------------------------------------------
+# Step 5b: Map Overlapping CpGs to hg19 Coordinates & GENCODE v19 Gene TSS (< 5 kb, Per-Trait)
+# ------------------------------------------------------------------------------
+rule map_cpg_to_tss_genes:
+    input:
+        overlap="results/methylation/dna_asm_{trait}_gwas_overlap.tsv",
+        cpg_coordinates=config["methylation"]["cpg_coordinates"],
+        gene_tss=config["methylation"]["gene_tss"]
+    output:
+        "results/methylation/dna_asm_{trait}_cpg_gene_tss_matches.tsv"
+    params:
+        tss_distance_cutoff=config["methylation"].get("tss_distance_cutoff", 5000),
+        env_setup=lambda wildcards: get_env_setup("snakemake_env"),
+        python_bin=get_python_bin(),
+        partition=config.get("slurm_partition", "irbio01"),
+        time="00:15:00"
+    resources:
+        mem_mb=4000,
+        cpus=1,
+        runtime=15,
+        slurm_partition=config.get("slurm_partition", "irbio01"),
+        slurm_extra="'--output=logs/map_cpg_to_tss_genes_%j.out --error=logs/map_cpg_to_tss_genes_%j.err'"
+    shell:
+        """
+        {params.env_setup}{params.python_bin} scripts/map_cpg_tss.py \
+            --overlap {input.overlap} \
+            --cpg-coords {input.cpg_coordinates} \
+            --gene-tss {input.gene_tss} \
+            --cutoff {params.tss_distance_cutoff} \
+            --output {output}
+        """
+
+# ------------------------------------------------------------------------------
+# Step 5c: Query GTEx v10 Across 13 Brain Tissues for DNA ASM Overlapping Variants
+# ------------------------------------------------------------------------------
+rule lookup_gtex_brain_eqtls:
+    input:
+        overlap="results/methylation/dna_asm_{trait}_gwas_overlap.tsv"
+    output:
+        "results/methylation/dna_asm_{trait}_gtex_brain_eqtls.tsv"
+    params:
+        tissues=" ".join(config.get("gtex", {}).get("brain_tissues", [])),
+        p_threshold=config.get("gtex", {}).get("p_threshold", 0.05),
+        gwas_p_threshold=config.get("gtex", {}).get("gwas_p_threshold", 0.001),
+        cache_file=config.get("gtex", {}).get("cache_file", "results/methylation/.gtex_eqtl_cache.json"),
+        env_setup=lambda wildcards: get_env_setup("snakemake_env"),
+        python_bin=get_python_bin(),
+        partition=config.get("slurm_partition", "irbio01"),
+        time="00:30:00"
+    resources:
+        mem_mb=4000,
+        cpus=1,
+        runtime=30,
+        slurm_partition=config.get("slurm_partition", "irbio01"),
+        slurm_extra="'--output=logs/lookup_gtex_brain_eqtls_%j.out --error=logs/lookup_gtex_brain_eqtls_%j.err'"
+    shell:
+        """
+        {params.env_setup}{params.python_bin} scripts/lookup_gtex_brain_eqtls.py \
+            --overlap {input.overlap} \
+            --output {output} \
+            --tissues {params.tissues} \
+            --p-threshold {params.p_threshold} \
+            --gwas-p-threshold {params.gwas_p_threshold} \
+            --cache-file {params.cache_file}
+        """
+
+# ------------------------------------------------------------------------------
+# Step 5d: Compare Nearest CpG TSS Genes (< 5 kb) with GTEx Brain eQTL Target Genes
+# ------------------------------------------------------------------------------
+rule compare_tss_and_gtex_genes:
+    input:
+        tss="results/methylation/dna_asm_{trait}_cpg_gene_tss_matches.tsv",
+        gtex="results/methylation/dna_asm_{trait}_gtex_brain_eqtls.tsv"
+    output:
+        full="results/methylation/dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv",
+        concordant="results/methylation/dna_asm_{trait}_concordant_genes_summary.tsv"
+    params:
+        trait="{trait}",
+        env_setup=lambda wildcards: get_env_setup("snakemake_env"),
+        python_bin=get_python_bin(),
+        partition=config.get("slurm_partition", "irbio01"),
+        time="00:15:00"
+    resources:
+        mem_mb=4000,
+        cpus=1,
+        runtime=15,
+        slurm_partition=config.get("slurm_partition", "irbio01"),
+        slurm_extra="'--output=logs/compare_tss_and_gtex_genes_%j.out --error=logs/compare_tss_and_gtex_genes_%j.err'"
+    shell:
+        """
+        {params.env_setup}{params.python_bin} scripts/compare_tss_gtex.py \
+            --tss {input.tss} \
+            --gtex {input.gtex} \
+            --trait {params.trait} \
+            --output-full {output.full} \
+            --output-concordant {output.concordant}
+        """
+
+# ------------------------------------------------------------------------------
+# Step 5e: Cross-Trait DNA ASM FDR Recurrence & Functional Concordance Summary
+# ------------------------------------------------------------------------------
+rule cross_trait_asm_summary:
+    input:
+        expand("results/methylation/dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv", trait=TRAITS)
+    output:
+        tsv="results/methylation/comparisons/cross_trait_asm_recurrent_snps.tsv"
+    params:
+        method=config.get("cross_trait", {}).get("fdr_method", "storey"),
+        k=config.get("cross_trait", {}).get("min_recurrence", 2),
+        threshold=config.get("cross_trait", {}).get("fdr_threshold", 0.05),
+        env_setup=lambda wildcards: get_env_setup("snakemake_env"),
+        python_bin=get_python_bin(),
+        partition=config.get("slurm_partition", "irbio01"),
+        time="00:15:00"
+    resources:
+        mem_mb=4000,
+        cpus=1,
+        runtime=15,
+        slurm_partition=config.get("slurm_partition", "irbio01"),
+        slurm_extra="'--output=logs/cross_trait_asm_summary_%j.out --error=logs/cross_trait_asm_summary_%j.err'"
+    shell:
+        """
+        {params.env_setup}{params.python_bin} scripts/interactive_cross_trait_asm.py \
+            --input-dir results/methylation \
+            --method {params.method} \
+            --threshold {params.threshold} \
+            --min-traits {params.k} \
+            --output {output.tsv}
+        """
+
+# ------------------------------------------------------------------------------
+# Step 5f: Cross-Trait RNA m6A FDR Recurrence, Ensembl/GTEx Annotation & Heatmap
+# ------------------------------------------------------------------------------
+rule cross_trait_rna_m6a_summary:
+    input:
+        expand("results/methylation/RNA_m6A_{trait}_overlap_fullheaders.txt", trait=TRAITS)
+    output:
+        sig_tsv="results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps.tsv",
+        annotated="results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps_annotated.tsv",
+        summary="results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps_summary.tsv",
+        heatmap_pdf="results/figures/cross_trait_rna_m6a_recurrent_snps_annotated_effect_heatmap.pdf",
+        heatmap_png="results/figures/cross_trait_rna_m6a_recurrent_snps_annotated_effect_heatmap.png"
+    params:
+        method=config.get("cross_trait", {}).get("fdr_method", "storey"),
+        k=config.get("cross_trait", {}).get("min_recurrence", 2),
+        env_setup=lambda wildcards: get_env_setup("snakemake_env"),
+        python_bin=get_python_bin(),
+        partition=config.get("slurm_partition", "irbio01"),
+        time="00:30:00"
+    resources:
+        mem_mb=4000,
+        cpus=1,
+        runtime=30,
+        slurm_partition=config.get("slurm_partition", "irbio01"),
+        slurm_extra="'--output=logs/cross_trait_rna_m6a_summary_%j.out --error=logs/cross_trait_rna_m6a_summary_%j.err'"
+    shell:
+        """
+        {params.env_setup}{params.python_bin} scripts/run_interactive_pipeline.py \
+            --meth RNA_m6A \
+            --traits all \
+            --min-k {params.k} \
+            --fdr-method {params.method} \
+            --metric effect \
+            --threads 8 \
+            --output {output.sig_tsv}
         """

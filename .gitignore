@@ -33,10 +33,18 @@ data/methylation/*
 results/
 logs/
 
-# Python cache & temporary files
+# Python cache, API caches & temporary files
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.api_cache.json
+.gtex_eqtl_cache.json
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.env
 
 # Compressed archives & large tables (safety net)
 *.gz

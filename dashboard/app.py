@@ -41,17 +41,23 @@ if str(SCRIPTS_DIR) not in sys.path:
 try:
     from compare_overlap_snps import discover_available_files, compare_and_filter
     from annotate_snps_genes import annotate_file, DEFAULT_CACHE_FILE
+    from interactive_cross_trait_asm import (
+        discover_trait_comparison_files,
+        run_cross_trait_asm_analysis,
+    )
 except ImportError:
     discover_available_files = None
     compare_and_filter = None
     annotate_file = None
+    discover_trait_comparison_files = None
+    run_cross_trait_asm_analysis = None
     DEFAULT_CACHE_FILE = str(PROJECT_ROOT / "results/methylation/.api_cache.json")
 
 
 def discover_available_datasets(directory: Path) -> dict:
     """
-    Scans the results directory for summary files (*_summary.tsv) and pairs
-    each with its corresponding *_annotated.tsv file.
+    Scans the results/methylation/comparisons directory for RNA m6A summary files
+    (*_summary.tsv) and pairs each with its corresponding *_annotated.tsv file.
     """
     if not directory.exists():
         return {}
@@ -60,19 +66,32 @@ def discover_available_datasets(directory: Path) -> dict:
     dataset_map = {}
 
     for s_path in summary_files:
+        name_lower = s_path.name.lower()
+        if "dna_asm" in name_lower or "cross_trait_asm" in name_lower:
+            continue
+
         # Match companion annotated file
         a_path = s_path.parent / s_path.name.replace("_summary.tsv", "_annotated.tsv")
         if a_path.exists():
+            # Check header comment if present to exclude pure DNA ASM runs
+            try:
+                with open(s_path, "r", encoding="utf-8") as fh:
+                    first_line = fh.readline()
+                if first_line.startswith("#") and "DNA ASM" in first_line and "m6A" not in first_line:
+                    continue
+            except OSError:
+                pass
+
             stem_name = s_path.name.replace("_sig_snps_summary.tsv", "").replace("_summary.tsv", "")
-            
-            # Format clean display label
+
+            # Format clean display label for RNA m6A runs
             if "_storey" in stem_name.lower():
-                label = f"Storey's q-value ({stem_name})"
+                label = f"RNA m6A — Storey's q-value ({stem_name})"
             elif "_bh" in stem_name.lower():
-                label = f"Benjamini-Hochberg BH ({stem_name})"
+                label = f"RNA m6A — Benjamini-Hochberg BH ({stem_name})"
             else:
-                label = stem_name
-                
+                label = f"RNA m6A ({stem_name})"
+
             dataset_map[label] = (str(s_path), str(a_path))
 
     return dataset_map
@@ -352,8 +371,8 @@ def generate_publication_figure_bytes(df, metric="effect", cap_percentile=90):
                 if sym:
                     ax.text(c_i, r_i, sym, ha="center", va="center", color="black", fontsize=13, weight="bold")
 
-    ax.set_title("Cross-Trait Pleiotropy & Brain Gene Architecture", fontsize=15, pad=18, weight="bold")
-    ax.set_xlabel("Shared Methylation Variants & Implicated Genes (Ensembl/GTEx)", fontsize=11, labelpad=12, weight="bold")
+    ax.set_title("RNA m6A Cross-Trait Pleiotropy & Brain Gene Architecture", fontsize=15, pad=18, weight="bold")
+    ax.set_xlabel("Shared RNA m6A Variants & Implicated Genes (Ensembl VEP / GTEx Brain)", fontsize=11, labelpad=12, weight="bold")
     ax.set_ylabel("GWAS Traits", fontsize=11, labelpad=12, weight="bold")
 
     plt.xticks(rotation=0, ha="center", fontsize=9)
@@ -381,30 +400,41 @@ def generate_publication_figure_bytes(df, metric="effect", cap_percentile=90):
 
 
 # -----------------------------------------------------------------------------
-# Main Tabs: Visual Explorer vs. In-Dashboard Comparison Generator
+# Main Tabs: RNA m6A Explorer, DNA ASM Functional Convergence, & RNA m6A Generator
 # -----------------------------------------------------------------------------
-tab_explore, tab_generate = st.tabs(["📊 Visual Explorer", "⚙️ Run New Comparison & Annotation"])
+tab_explore, tab_asm_convergence, tab_generate = st.tabs([
+    "🧪 RNA m6A Methylation Explorer",
+    "🧬 DNA ASM Functional Convergence",
+    "⚙️ Run New RNA m6A Comparison & Annotation",
+])
 
 available_datasets = discover_available_datasets(COMPARISONS_DIR)
 
 # -----------------------------------------------------------------------------
-# TAB 1: VISUAL EXPLORER
+# TAB 1: RNA m6A METHYLATION EXPLORER (Ensembl VEP ∩ GTEx Brain eQTLs)
 # -----------------------------------------------------------------------------
 with tab_explore:
+    st.subheader("🧪 RNA m6A Cross-Trait Pleiotropy & Functional Convergence")
+    st.markdown(
+        "Integrates **RNA $N^6$-methyladenosine ($m^6\\text{A}$)** candidate variants across GWAS phenotypes, "
+        "evaluating functional convergence between **Ensembl VEP transcript consequences** "
+        "and **GTEx v10 human brain cis-eQTL target genes (13 regions)**."
+    )
+
     if not available_datasets:
         st.info(
-            "👋 **Welcome!** No pre-computed comparison runs were found in `results/methylation/comparisons/`.\n\n"
-            "Please switch to the **⚙️ Run New Comparison & Annotation** tab above to generate your first multi-trait analysis dataset directly!"
+            "👋 **Welcome!** No pre-computed RNA $m^6\\text{A}$ comparison runs were found in `results/methylation/comparisons/`.\n\n"
+            "Please switch to the **⚙️ Run New RNA m6A Comparison & Annotation** tab above to generate your first RNA $m^6\\text{A}$ multi-trait analysis dataset!"
         )
     else:
         # Sidebar: Dataset Selection
-        st.sidebar.header("📁 Dataset & FDR Engine")
+        st.sidebar.header("🧪 RNA m6A Dataset & FDR")
 
         selected_dataset_label = st.sidebar.selectbox(
-            "Select Analysis Run:",
+            "Select RNA m6A Analysis Run:",
             options=list(available_datasets.keys()),
             index=0,
-            help="Toggle between Storey's q-value and Benjamini-Hochberg (BH) runs."
+            help="Toggle between Storey's q-value and Benjamini-Hochberg (BH) RNA m6A runs."
         )
 
         selected_summary_path, selected_annotated_path = available_datasets[selected_dataset_label]
@@ -412,10 +442,10 @@ with tab_explore:
 
         # Sidebar: Filter & Thresholds
         st.sidebar.markdown("---")
-        st.sidebar.header("Filter & Thresholds")
+        st.sidebar.header("RNA m6A Filter & Thresholds")
 
-        max_observed_k = int(df_summary["Num_Sig_Traits"].max()) if not df_summary.empty else 14
-        default_k = min(4, max(2, max_observed_k))
+        max_observed_k = int(df_summary["Num_Sig_Traits"].max()) if not df_summary.empty else 3
+        default_k = min(2, max(1, max_observed_k))
 
         min_k = st.sidebar.slider(
             "Minimum Trait Recurrence (k)",
@@ -426,12 +456,12 @@ with tab_explore:
         )
 
         require_gene = st.sidebar.checkbox(
-            "Filter to Convergent Genes Only (Exclude 'None' / 'No match')",
+            "Filter to Convergent Genes Only (Ensembl == GTEx Brain)",
             value=False
         )
 
         st.sidebar.markdown("---")
-        st.sidebar.header("Visualization Settings")
+        st.sidebar.header("RNA m6A Visualization Settings")
 
         heatmap_metric = st.sidebar.radio(
             "Heatmap Metric",
@@ -656,69 +686,282 @@ with tab_explore:
             st.json(debug_info)
 
 # -----------------------------------------------------------------------------
-# TAB 2: IN-DASHBOARD COMPARISON GENERATOR
+# TAB 2: DNA ASM FUNCTIONAL CONVERGENCE (CpG TSS < 5 kb ∩ GTEx Brain eQTLs)
+# -----------------------------------------------------------------------------
+with tab_asm_convergence:
+    st.subheader("🧬 DNA ASM Cross-Trait Recurrence & Functional Convergence")
+    st.markdown(
+        "Integrates **DNA Allele-Specific Methylation (ASM)** Tag & LD Proxy variants across GWAS traits, "
+        "evaluating convergence between **proximal GENCODE v19 gene promoters ($< 5\\text{ kb}$ from CpG)** "
+        "and **GTEx v10 human brain cis-eQTL target genes (13 regions)**."
+    )
+
+    if discover_trait_comparison_files is None or run_cross_trait_asm_analysis is None:
+        st.error("Could not import `scripts/interactive_cross_trait_asm.py`.")
+    else:
+        asm_trait_files = discover_trait_comparison_files(OVERLAP_DIR)
+        if not asm_trait_files:
+            st.warning(
+                "No `dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv` files found in `results/methylation/`.\n\n"
+                "Run `snakemake --cores 2 methylation` (or `--profile profiles/slurm methylation`) first."
+            )
+        else:
+            asm_traits = sorted(asm_trait_files.keys())
+            n_asm_traits = len(asm_traits)
+
+            ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1.4, 1.1, 1.0, 1.2])
+            with ctrl_col1:
+                asm_fdr_label = st.radio(
+                    "Multiple-Testing Method:",
+                    options=["Storey's q-value (pi0-adjusted)", "Benjamini-Hochberg FDR"],
+                    index=0,
+                    key="asm_fdr_method",
+                )
+                asm_method = "storey" if "Storey" in asm_fdr_label else "bh"
+
+            with ctrl_col2:
+                asm_k = st.slider(
+                    "Min Trait Recurrence (k):",
+                    min_value=1,
+                    max_value=max(1, n_asm_traits),
+                    value=min(2, n_asm_traits),
+                    step=1,
+                    key="asm_min_k",
+                )
+
+            with ctrl_col3:
+                asm_alpha = st.number_input(
+                    "FDR / q Threshold:",
+                    min_value=0.0001,
+                    max_value=0.25,
+                    value=0.05,
+                    step=0.01,
+                    format="%.3f",
+                    key="asm_alpha",
+                )
+
+            with ctrl_col4:
+                asm_only_concordant = st.checkbox(
+                    "Only Concordant Effector Genes (TSS < 5 kb == GTEx Brain eQTL)",
+                    value=False,
+                    key="asm_only_conc",
+                )
+
+            @st.cache_data(show_spinner="Computing cross-trait DNA ASM FDR & functional convergence...")
+            def cached_asm_analysis(input_dir, method, threshold, min_k):
+                return run_cross_trait_asm_analysis(
+                    input_dir=input_dir,
+                    method=method,
+                    threshold=threshold,
+                    min_traits=min_k,
+                    output_path=str(PROJECT_ROOT / "results/methylation/comparisons/cross_trait_asm_recurrent_snps.tsv"),
+                    save_output=True,
+                )
+
+            asm_wide, asm_sig_any, asm_all_long, asm_trait_stats = cached_asm_analysis(
+                OVERLAP_DIR, asm_method, float(asm_alpha), int(asm_k)
+            )
+
+            display_wide = asm_wide.copy()
+            if asm_only_concordant and not display_wide.empty:
+                display_wide = display_wide[display_wide["CONCORDANT_GENES"] != "None"].copy()
+
+            # KPI Metrics Row
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            kpi1.metric(f"Recurrent ASM SNPs (k ≥ {asm_k})", f"{len(display_wide):,}")
+            n_conc_snps = (
+                int((display_wide["CONCORDANT_GENES"] != "None").sum())
+                if not display_wide.empty
+                else 0
+            )
+            kpi2.metric("Concordant SNPs (TSS == GTEx)", f"{n_conc_snps:,}")
+            unique_conc_genes = set()
+            if not display_wide.empty:
+                for g_str in display_wide["CONCORDANT_GENES"]:
+                    if g_str and g_str != "None":
+                        for g in str(g_str).split(","):
+                            if g.strip():
+                                unique_conc_genes.add(g.strip())
+            kpi3.metric("Unique Convergent Brain Genes", f"{len(unique_conc_genes):,}")
+            kpi4.metric("Evaluated GWAS Traits", f"{n_asm_traits}")
+
+            st.markdown("---")
+
+            # Row 1: Recurrence Barplot & Per-Trait Summary Table
+            viz_col1, viz_col2 = st.columns([1.2, 1.2])
+            with viz_col1:
+                st.markdown("#### 📊 Variant Recurrence Distribution Across Traits")
+                if not asm_sig_any.empty:
+                    rec_counts = (
+                        asm_sig_any.assign(
+                            Concordance_Status=np.where(
+                                asm_sig_any["CONCORDANT_GENES"] != "None",
+                                "Concordant (TSS < 5 kb == GTEx)",
+                                "Other ASM Hit",
+                            )
+                        )
+                        .groupby(["N_TRAITS", "Concordance_Status"], as_index=False)
+                        .size()
+                        .rename(columns={"size": "SNP_Count"})
+                    )
+                    rec_fig = px.bar(
+                        rec_counts,
+                        x="N_TRAITS",
+                        y="SNP_Count",
+                        color="Concordance_Status",
+                        barmode="stack",
+                        text_auto=True,
+                        color_discrete_map={
+                            "Concordant (TSS < 5 kb == GTEx)": "#d95f02",
+                            "Other ASM Hit": "#7570b3",
+                        },
+                        labels={
+                            "N_TRAITS": "Number of Significant Traits (k)",
+                            "SNP_Count": "Number of Unique DNA ASM SNPs",
+                        },
+                    )
+                    rec_fig.update_layout(
+                        height=340,
+                        xaxis=dict(dtick=1),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        margin=dict(l=20, r=20, t=40, b=20),
+                    )
+                    st.plotly_chart(rec_fig, width="stretch")
+                else:
+                    st.info("No variants reached significance at the current threshold.")
+
+            with viz_col2:
+                st.markdown("#### 📋 Per-Trait Candidate FDR Summary")
+                if asm_trait_stats:
+                    st.dataframe(pd.DataFrame(asm_trait_stats), width="stretch", height=280)
+
+            st.markdown("---")
+
+            # Row 2: Cross-Trait Effect Heatmap
+            st.markdown(f"#### 🔥 Cross-Trait Effect Size Heatmap (`BETA`, $k \\ge {asm_k}$)")
+            if not display_wide.empty:
+                max_plot_snps = st.slider(
+                    "Max Top Recurrent Variants to Display in Heatmap:",
+                    min_value=10,
+                    max_value=min(150, max(10, len(display_wide))),
+                    value=min(40, len(display_wide)),
+                    step=5,
+                    key="asm_max_heatmap_snps",
+                )
+                top_snps_df = display_wide.head(max_plot_snps).copy()
+                top_snp_list = top_snps_df["SNP"].tolist()
+
+                # Pull complete BETA and ADJ_P across all traits from asm_all_long so even sub-threshold directions are visible
+                sub_long = asm_all_long[asm_all_long["QUERY_SNP"].isin(top_snp_list)].copy()
+                beta_piv = (
+                    sub_long.pivot_table(
+                        index="TRAIT", columns="QUERY_SNP", values="GWAS_BETA", aggfunc="first"
+                    )
+                    .reindex(columns=top_snp_list)
+                    .fillna(0.0)
+                )
+
+                col_labels_asm = []
+                for _, r_row in top_snps_df.iterrows():
+                    snp_id = r_row["SNP"]
+                    c_gene = r_row["CONCORDANT_GENES"]
+                    t_gene = r_row["TSS_GENES_5KB"]
+                    gene_tag = f"★{c_gene}" if c_gene != "None" else (t_gene if t_gene != "None" else "Intergenic")
+                    if len(gene_tag) > 22:
+                        gene_tag = gene_tag[:19] + "..."
+                    col_labels_asm.append(f"<b>{snp_id}</b><br>({gene_tag})")
+
+                abs_b = np.abs(beta_piv.values)
+                b_max = float(np.percentile(abs_b[abs_b > 0], 95)) if (abs_b > 0).any() else 0.05
+                b_max = max(b_max, 0.02)
+
+                asm_hm_fig = px.imshow(
+                    beta_piv,
+                    x=col_labels_asm,
+                    y=beta_piv.index,
+                    color_continuous_scale="RdBu_r",
+                    range_color=[-b_max, b_max],
+                    aspect="auto",
+                    labels=dict(
+                        x="DNA ASM Variant (★ = Concordant TSS & Brain eQTL Gene)",
+                        y="GWAS Trait",
+                        color="GWAS BETA",
+                    ),
+                )
+                asm_hm_fig.update_layout(
+                    height=440,
+                    xaxis_tickangle=-45,
+                    margin=dict(l=40, r=40, t=20, b=100),
+                )
+                st.plotly_chart(asm_hm_fig, width="stretch")
+            else:
+                st.info("No variants match the current recurrence and concordance filters.")
+
+            st.markdown("---")
+
+            # Row 3: Interactive Concordance & Recurrence Table + One-Click Download
+            tbl_hdr_left, tbl_hdr_right = st.columns([3, 1])
+            with tbl_hdr_left:
+                st.markdown("#### 🧬 Recurrent DNA ASM Variants, CpG Sites, Proximal TSS (< 5 kb) & GTEx Brain eQTLs")
+            with tbl_hdr_right:
+                tsv_export_str = display_wide.to_csv(sep="\t", index=False, na_rep="NA")
+                st.download_button(
+                    label="📥 Download Filtered TSV",
+                    data=tsv_export_str,
+                    file_name=f"cross_trait_asm_k{asm_k}_{asm_method}.tsv",
+                    mime="text/tab-separated-values",
+                    key="asm_download_btn",
+                )
+
+            st.dataframe(display_wide, width="stretch", height=420)
+
+# -----------------------------------------------------------------------------
+# TAB 3: IN-DASHBOARD RNA m6A COMPARISON GENERATOR
 # -----------------------------------------------------------------------------
 with tab_generate:
-    st.subheader("⚙️ Generate New Comparison & Effector Gene Annotation")
+    st.subheader("⚙️ Generate New RNA m6A Comparison & Effector Gene Annotation")
     st.markdown(
-        "Execute candidate variant aggregation directly from the dashboard. Filter by Storey's $q$-value "
-        "or Benjamini-Hochberg (BH) FDR, set recurrence thresholds, and automatically run Ensembl VEP & GTEx v10 brain eQTL annotation."
+        "Execute **RNA $m^6\\text{A}$** candidate variant aggregation directly from the dashboard. "
+        "Filter by Storey's $q$-value or Benjamini-Hochberg (BH) FDR, set recurrence thresholds ($k$), "
+        "and automatically run **Ensembl VEP & GTEx v10 brain eQTL** annotation (no CpG or TSS lookup needed)."
     )
 
     if discover_available_files is None:
         st.error("Error: Could not import `scripts/compare_overlap_snps.py`. Ensure the `scripts/` directory is present.")
     else:
-        records = discover_available_files()
+        all_records = discover_available_files()
+        active_records = [r for r in all_records if r["meth"] in ("RNA_m6A", "RNAm6A")]
 
-        if not records:
-            st.warning(f"No candidate overlap tables (`*_overlap_fullheaders.txt`) found in `{OVERLAP_DIR}`.")
+        if not active_records:
+            st.warning(f"No RNA $m^6\\text{{A}}$ overlap tables (`RNA_m6A_*_overlap_fullheaders.txt`) found in `{OVERLAP_DIR}`.")
             st.info(
-                "Run the Tier 1 methylation overlap Snakemake step on your cluster first:\n\n"
+                "Run the Tier 1 methylation overlap Snakemake step first:\n\n"
                 "```bash\nsnakemake --profile profiles/slurm methylation\n```"
             )
         else:
-            st.success(f"Discovered **{len(records)}** extracted GWAS trait overlap files in `{OVERLAP_DIR}`.")
-
-            available_meth = sorted(list({r["meth"] for r in records}))
-            meth_options = ["All Types Combined (DNA_ASM & RNA_m6A)"] + available_meth
-
-            col_m1, col_m2 = st.columns([1, 1])
-            with col_m1:
-                selected_meth = st.selectbox(
-                    "Methylation Panel:",
-                    options=meth_options,
-                    index=0,
-                    help="Filter to DNA ASM, RNA m6A, or both combined."
-                )
-
-            # Filter records based on selected methylation type
-            if selected_meth.startswith("All"):
-                active_records = records
-            else:
-                active_records = [r for r in records if r["meth"] == selected_meth]
+            st.success(f"Discovered **{len(active_records)}** RNA $m^6\\text{{A}}$ GWAS trait overlap files in `{OVERLAP_DIR}`.")
 
             available_traits = sorted(list({r["trait"] for r in active_records}))
 
-            with col_m2:
-                fdr_method_label = st.radio(
-                    "FDR Correction Procedure:",
-                    options=["Storey's q-value (Cubic smoothing spline)", "Benjamini-Hochberg (fdr_bh)"],
-                    index=0,
-                    help="Storey q-value models the true proportion of null variants (pi0) across candidate SNPs."
-                )
-                chosen_fdr_method = "storey" if "Storey" in fdr_method_label else "bh"
+            fdr_method_label = st.radio(
+                "FDR Correction Procedure:",
+                options=["Storey's q-value (Cubic smoothing spline)", "Benjamini-Hochberg (fdr_bh)"],
+                index=0,
+                help="Storey q-value models the true proportion of null variants (pi0) across candidate RNA m6A SNPs."
+            )
+            chosen_fdr_method = "storey" if "Storey" in fdr_method_label else "bh"
 
             selected_traits = st.multiselect(
-                "Select GWAS Phenotypes to Compare:",
+                "Select GWAS Phenotypes to Compare (RNA m6A):",
                 options=available_traits,
                 default=available_traits,
-                help="Choose at least 2 phenotypes to assess pleiotropic recurrence."
+                help="Choose at least 2 phenotypes to assess RNA m6A pleiotropic recurrence."
             )
 
             num_traits_selected = len(selected_traits)
 
             if num_traits_selected < 2:
-                st.warning("Please select at least 2 phenotypes to run a cross-trait pleiotropy comparison.")
+                st.warning("Please select at least 2 phenotypes to run a cross-trait RNA m6A comparison.")
             else:
                 col_k1, col_k2 = st.columns([1, 1])
                 with col_k1:
@@ -726,17 +969,17 @@ with tab_generate:
                         "Minimum Significant Phenotypes (k):",
                         min_value=1,
                         max_value=num_traits_selected,
-                        value=min(3, num_traits_selected),
+                        value=min(2, num_traits_selected),
                         step=1,
-                        help="Only variants reaching FDR <= 0.05 in at least k phenotypes will be retained."
+                        help="Only RNA m6A variants reaching FDR <= 0.05 in at least k phenotypes will be retained."
                     )
 
                 with col_k2:
-                    default_out_name = f"common_{num_traits_selected}_k{min_k_input}_{chosen_fdr_method}_sig_snps.tsv"
+                    default_out_name = f"rna_m6a_{num_traits_selected}_k{min_k_input}_{chosen_fdr_method}_sig_snps.tsv"
                     custom_out_name = st.text_input(
                         "Output TSV Filename:",
                         value=default_out_name,
-                        help="Filename for the candidate recurrence table in results/methylation/comparisons/"
+                        help="Filename for the RNA m6A recurrence table in results/methylation/comparisons/"
                     )
 
                 col_opt1, col_opt2 = st.columns(2)
@@ -744,7 +987,7 @@ with tab_generate:
                     do_annotation = st.checkbox(
                         "Run Brain Effector Gene Annotation (Ensembl VEP + GTEx Brain v10)",
                         value=True,
-                        help="Queries external APIs for structural consequences and cis-eQTLs in 13 brain regions."
+                        help="Queries Ensembl VEP for transcript consequences and GTEx v10 for cis-eQTLs in 13 brain regions."
                     )
                 with col_opt2:
                     use_api_cache = st.checkbox(
@@ -753,12 +996,12 @@ with tab_generate:
                         help="Speeds up execution and prevents redundant queries for previously annotated variants."
                     )
 
-                if st.button("🚀 Run Comparison & Effector Annotation", type="primary"):
+                if st.button("🚀 Run RNA m6A Comparison & Effector Annotation", type="primary"):
                     target_records = [r for r in active_records if r["trait"] in selected_traits]
                     output_file_path = os.path.join(str(COMPARISONS_DIR), custom_out_name)
 
-                    with st.status("Executing Epigenetic Comparison Pipeline...", expanded=True) as status_box:
-                        st.write(f"1️⃣ Merging {len(target_records)} phenotype datasets & applying {chosen_fdr_method.upper()} FDR...")
+                    with st.status("Executing RNA m6A Epigenetic Comparison Pipeline...", expanded=True) as status_box:
+                        st.write(f"1️⃣ Merging {len(target_records)} RNA m6A phenotype datasets & applying {chosen_fdr_method.upper()} FDR...")
                         cmp_out, final_df = compare_and_filter(
                             target_records,
                             output_file_path,
@@ -767,10 +1010,10 @@ with tab_generate:
                         )
 
                         if final_df.empty:
-                            status_box.update(label="No variants met the recurrence criteria.", state="error")
+                            status_box.update(label="No RNA m6A variants met the recurrence criteria.", state="error")
                             st.error(f"0 variants reached FDR <= 0.05 in >= {min_k_input} phenotypes. Try lowering k.")
                         else:
-                            st.write(f"✓ Found {len(final_df):,} pleiotropic variants meeting $k \\ge {min_k_input}$.")
+                            st.write(f"✓ Found {len(final_df):,} pleiotropic RNA m6A variants meeting $k \\ge {min_k_input}$.")
 
                             if do_annotation and annotate_file is not None:
                                 st.write("2️⃣ Querying Ensembl VEP & GTEx Portal v10 (13 Brain Tissues)...")
@@ -779,16 +1022,16 @@ with tab_generate:
                                     input_path=cmp_out,
                                     output_path=annotated_tsv,
                                     create_summary=True,
-                                    max_workers=5,
+                                    max_workers=8,
                                     cache_path=str(DEFAULT_CACHE_FILE),
                                     use_cache=use_api_cache
                                 )
-                                st.write("✓ Annotation and convergent effector summary complete!")
+                                st.write("✓ Ensembl VEP & GTEx Brain annotation complete!")
 
                             # Clear Streamlit cache to load the new dataset
                             st.cache_data.clear()
-                            status_box.update(label="Pipeline Completed Successfully!", state="complete", expanded=False)
+                            status_box.update(label="RNA m6A Pipeline Completed Successfully!", state="complete", expanded=False)
                             st.success(
                                 f"🎉 Run **{custom_out_name}** generated successfully! "
-                                "Switch to the **📊 Visual Explorer** tab to inspect the interactive heatmap and effector targets."
+                                "Switch to the **🧪 RNA m6A Methylation Explorer** tab to inspect the interactive heatmap and effector targets."
                             )

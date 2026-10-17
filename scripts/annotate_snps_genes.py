@@ -71,36 +71,80 @@ def clean_rsid(val):
         val_str = 'rs' + val_str
     return val_str
 
-def get_ensembl_genes(rsid, session):
+def get_ensembl_genes(rsid, session, retries=3):
     """Fetch structurally associated/consequence genes via Ensembl VEP REST API."""
     if not rsid:
         return "None"
         
     url = f"https://rest.ensembl.org/vep/human/id/{rsid}?"
-    try:
-        response = session.get(url, headers={"Content-Type": "application/json"}, timeout=25)
-        if response.status_code == 200:
-            data = response.json()
-            if not data or not isinstance(data, list):
-                return "None"
+    for attempt in range(retries):
+        try:
+            response = session.get(
+                url,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=25
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if not data or not isinstance(data, list):
+                    return "None"
+                    
+                genes = []
+                for entry in data:
+                    consequences = entry.get('transcript_consequences', [])
+                    for cons in consequences:
+                        gene_id = cons.get('gene_symbol') or cons.get('gene_id')
+                        if gene_id:
+                            genes.append(gene_id)
                 
-            genes = []
-            for entry in data:
-                consequences = entry.get('transcript_consequences', [])
-                for cons in consequences:
-                    gene_id = cons.get('gene_symbol') or cons.get('gene_id')
-                    if gene_id:
-                        genes.append(gene_id)
-            
-            unique_genes = sorted(list(set(filter(None, genes))))
-            return ", ".join(unique_genes) if unique_genes else "None"
-        elif response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", 1))
-            time.sleep(retry_after)
-            return get_ensembl_genes(rsid, session)
-    except Exception as e:
-        print(f"    [!] Ensembl VEP Network Error for {rsid}: {e}")
+                unique_genes = sorted(list(set(filter(None, genes))))
+                return ", ".join(unique_genes) if unique_genes else "None"
+            elif response.status_code in (429, 500, 502, 503, 504):
+                retry_after = float(response.headers.get("Retry-After", 1.5 * (attempt + 1)))
+                time.sleep(retry_after)
+                continue
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"    [!] Ensembl VEP Network Error for {rsid}: {e}")
+            time.sleep(1.0 * (attempt + 1))
     return "None"
+
+def batch_get_ensembl_genes(rsids, session, chunk_size=100):
+    """Batch-fetch Ensembl VEP gene consequences for a list of rsIDs via POST /vep/human/id."""
+    results = {}
+    clean_list = [r for r in dict.fromkeys(rsids) if r]
+    url = "https://rest.ensembl.org/vep/human/id"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    for i in range(0, len(clean_list), chunk_size):
+        chunk = clean_list[i:i + chunk_size]
+        for attempt in range(3):
+            try:
+                resp = session.post(url, headers=headers, json={"ids": chunk}, timeout=45)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        for entry in data:
+                            qid = clean_rsid(entry.get("id") or entry.get("input"))
+                            if not qid:
+                                continue
+                            genes = []
+                            for cons in entry.get("transcript_consequences", []):
+                                g = cons.get("gene_symbol") or cons.get("gene_id")
+                                if g:
+                                    genes.append(g)
+                            unique_genes = sorted(list(set(filter(None, genes))))
+                            results[qid] = ", ".join(unique_genes) if unique_genes else "None"
+                    break
+                elif resp.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(float(resp.headers.get("Retry-After", 2.0 * (attempt + 1))))
+            except Exception:
+                time.sleep(1.5 * (attempt + 1))
+
+    for r in clean_list:
+        if r not in results:
+            results[r] = get_ensembl_genes(r, session)
+    return results
 
 def get_gtex_brain_eqtls(rsid, session):
     """Fetch significant eQTL target genes across brain tissues using GTEx Portal API v2."""
@@ -194,20 +238,24 @@ def generate_summary_file(df, output_summary_path, comment_lines=None):
     print(f"[OK] Summary file written to: {output_summary_path}\n")
 
 def fetch_worker(row_idx, raw_snp, total_snps, session, cache=None, use_cache=True):
-    """Worker task that queries both APIs for a single SNP, checking cache first."""
+    """Worker task that queries APIs for a single SNP, checking cache first."""
     clean_snp = clean_rsid(raw_snp)
     is_cached = False
-    
+    ensembl_genes = "None"
+    gtex_genes = None
+
     if use_cache and cache is not None and clean_snp:
         with cache_lock:
             cached_data = cache.get(clean_snp)
         if cached_data and isinstance(cached_data, dict):
             ensembl_genes = cached_data.get("ensembl", "None")
-            gtex_genes = cached_data.get("gtex", "None")
-            is_cached = True
+            if "gtex" in cached_data and cached_data.get("gtex") is not None:
+                gtex_genes = cached_data.get("gtex")
+                is_cached = True
 
-    if not is_cached:
-        ensembl_genes = get_ensembl_genes(clean_snp, session)
+    if gtex_genes is None:
+        if ensembl_genes == "None":
+            ensembl_genes = get_ensembl_genes(clean_snp, session)
         gtex_genes = get_gtex_brain_eqtls(clean_snp, session)
         if use_cache and cache is not None and clean_snp:
             with cache_lock:
@@ -249,7 +297,22 @@ def annotate_file(input_path, output_path, create_summary=None, max_workers=5, c
         print(f"Loaded {len(cache):,} cached variant annotations from {cache_path}")
 
     session = create_http_session(pool_size=max_workers * 2)
-    
+
+    # Batch-fetch Ensembl VEP consequences for any SNPs missing Ensembl data
+    all_clean_snps = [clean_rsid(df.iloc[idx][snp_col]) for idx in range(total_snps)]
+    need_ensembl = [
+        s for s in dict.fromkeys(all_clean_snps)
+        if s and (s not in cache or not isinstance(cache.get(s), dict) or cache[s].get("ensembl") in (None, "None", ""))
+    ]
+    if need_ensembl:
+        batch_ens = batch_get_ensembl_genes(need_ensembl, session)
+        with cache_lock:
+            for s, ens_val in batch_ens.items():
+                if s in cache and isinstance(cache[s], dict):
+                    cache[s]["ensembl"] = ens_val
+                else:
+                    cache[s] = {"ensembl": ens_val, "gtex": None}
+
     ensembl_results = [None] * total_snps
     gtex_results = [None] * total_snps
     

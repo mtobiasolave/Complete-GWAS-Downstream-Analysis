@@ -42,4 +42,32 @@ set-resources:
     runtime: 15
     mem_mb: 4000
     slurm_partition: "irbio01"
+  overlap_dna_asm:
+    runtime: 30
+    mem_mb: 8000
+    slurm_partition: "irbio01"
+  map_cpg_to_tss_genes:
+    runtime: 15
+    mem_mb: 4000
+    slurm_partition: "irbio01"
+  lookup_gtex_brain_eqtls:
+    runtime: 30
+    mem_mb: 4000
+    slurm_partition: "irbio01"
+  compare_tss_and_gtex_genes:
+    runtime: 15
+    mem_mb: 4000
+    slurm_partition: "irbio01"
+  cross_trait_asm_summary:
+    runtime: 15
+    mem_mb: 4000
+    slurm_partition: "irbio01"
+  cross_trait_rna_m6a_summary:
+    runtime: 30
+    mem_mb: 4000
+    slurm_partition: "irbio01"
+
+
+
+
 
