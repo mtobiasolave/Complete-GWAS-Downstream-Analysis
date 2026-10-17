@@ -10,8 +10,26 @@
 # Bash commands for running the pipeline
 bash_command.txt
 
-# Large input data and generated outputs
-data/
+# Large input data with a few exclusions
+# Ignore all subdirectories and files inside data/
+data/*
+
+# Allow Git to descend into the specific subdirectories
+!data/annotations/
+!data/methylation/
+
+# Ignore everything inside data/annotations/ except your reference tables
+data/annotations/*
+!data/annotations/cpg_coordinates_hg19.tsv
+!data/annotations/gencode_v19_gene_tss.tsv
+
+# Ignore everything inside data/methylation/ except the required mapping/SNP tables
+data/methylation/*
+!data/methylation/DNA_ASM_mapping_table.tsv
+!data/methylation/DNA_ASM_SNPlist.txt
+!data/methylation/RNA_m6A_SNPlist.txt
+
+# Generated outputs
 results/
 logs/
 
