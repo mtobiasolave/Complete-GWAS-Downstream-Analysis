@@ -10,8 +10,14 @@ logs/
 __pycache__/
 *.py[cod]
 *$py.class
+*.tmp
+*.bak
 
-# Compressed archives & large tables (safety net)
+# Raw GTF annotations, Excel workbooks & compressed archives (safety net)
+*.gtf
+*.gtf.*
+*.gtf_withproteinids
+*.xlsx
 *.gz
 *.tar
 *.zip

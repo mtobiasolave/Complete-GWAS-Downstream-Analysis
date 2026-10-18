@@ -16,11 +16,12 @@ import sys
 
 import numpy as np
 import pandas as pd
-from statsmodels.stats.multitest import multipletests
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+
+from common_utils import compute_fdr, storey_qvalues as lambda05_storey_qvalues
 
 try:
     from compare_overlap_snps import storey_qvalues as spline_storey_qvalues
@@ -34,7 +35,7 @@ DEFAULT_OUTPUT_FILE = "results/methylation/comparisons/cross_trait_asm_recurrent
 def compute_storey_qvalues(p_values: np.ndarray) -> tuple:
     """
     Calculate Storey's q-values:
-    Uses spline-based pi0 estimation when available, falling back to the
+    Uses spline-based pi0 estimation when available (m >= 50), falling back to the
     Storey (2002) lambda=0.5 estimator: pi0 = min(1, sum(p > 0.5) / (0.5 * m)).
     """
     p = np.asarray(p_values, dtype=float)
@@ -47,22 +48,7 @@ def compute_storey_qvalues(p_values: np.ndarray) -> tuple:
     if spline_storey_qvalues is not None and m >= 50:
         return spline_storey_qvalues(p)
 
-    est_pi0 = float(min(1.0, np.sum(p_valid > 0.5) / (0.5 * m)))
-    est_pi0 = max(est_pi0, 1.0 / m)
-
-    sort_idx = np.argsort(p_valid)
-    p_sorted = p_valid[sort_idx]
-    ranks = np.arange(1, m + 1, dtype=float)
-    q_sorted = (est_pi0 * m * p_sorted) / ranks
-    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
-    q_sorted = np.clip(q_sorted, 0.0, 1.0)
-
-    q_valid = np.empty_like(p_valid)
-    q_valid[sort_idx] = q_sorted
-
-    q_full = np.full_like(p, np.nan, dtype=float)
-    q_full[valid_mask] = q_valid
-    return q_full, est_pi0
+    return lambda05_storey_qvalues(p, lambda_val=0.5, return_pi0=True)
 
 
 def discover_trait_comparison_files(input_dir: str = DEFAULT_INPUT_DIR) -> dict:
@@ -74,7 +60,6 @@ def discover_trait_comparison_files(input_dir: str = DEFAULT_INPUT_DIR) -> dict:
     """
     trait_files = {}
 
-    # Pattern 1: Flat layout
     flat_pattern = os.path.join(input_dir, "dna_asm_*_tss_vs_gtex_full_comparison.tsv")
     for path in sorted(glob.glob(flat_pattern)):
         base = os.path.basename(path)
@@ -82,7 +67,6 @@ def discover_trait_comparison_files(input_dir: str = DEFAULT_INPUT_DIR) -> dict:
         if m:
             trait_files[m.group(1)] = path
 
-    # Pattern 2: Nested layout
     nested_pattern = os.path.join(input_dir, "*", "dna_asm_tss_vs_gtex_full_comparison.tsv")
     for path in sorted(glob.glob(nested_pattern)):
         trait = os.path.basename(os.path.dirname(path))
@@ -93,7 +77,9 @@ def discover_trait_comparison_files(input_dir: str = DEFAULT_INPUT_DIR) -> dict:
 
 
 def join_unique_clean(values, exclude: set = None) -> str:
-    exclude_upper = {e.upper() for e in (exclude or {"", "NA", "NAN", "NONE", "<NA>", "NONE_WITHIN_5KB"})}
+    exclude_upper = {
+        e.upper() for e in (exclude or {"", "NA", "NAN", "NONE", "<NA>", "NONE_WITHIN_5KB"})
+    }
     items = []
     seen = set()
     for val in values:
@@ -181,12 +167,10 @@ def deduplicate_trait_table(df: pd.DataFrame, trait_name: str) -> tuple[pd.DataF
     df["DISTANCE_TO_TSS"] = pd.to_numeric(df["DISTANCE_TO_TSS"], errors="coerce")
     df = df.dropna(subset=["QUERY_SNP", "GWAS_PVALUE"])
 
-    # Identify concordant gene symbol where IS_CONCORDANT is True
     is_conc = df["IS_CONCORDANT"].astype(str).str.lower().isin(["true", "1"])
     df["_CONC_GENE"] = np.where(is_conc, df["TSS_GENE_SYMBOL"].astype(str).str.strip(), "")
     conc_snps = set(df.loc[is_conc & (df["_CONC_GENE"] != ""), "QUERY_SNP"].unique())
 
-    # 1 row per unique QUERY_SNP for multiple-testing correction
     base_snp = (
         df.sort_values("DISTANCE_TO_TSS", ascending=True, na_position="last")
         .drop_duplicates(subset=["QUERY_SNP"], keep="first")[
@@ -237,7 +221,7 @@ def run_cross_trait_asm_analysis(
         if method.lower() == "storey":
             adj_p, est_pi0 = compute_storey_qvalues(pvals)
         else:
-            _, adj_p, _, _ = multipletests(pvals, alpha=threshold, method="fdr_bh")
+            adj_p = compute_fdr(pvals, method="bh")
             est_pi0 = 1.0
 
         dedup_df["ADJ_P"] = adj_p
@@ -267,20 +251,15 @@ def run_cross_trait_asm_analysis(
 
     all_long = pd.concat(list(per_trait_dedup.values()), ignore_index=True)
 
-    # Filter to trait-significant rows (ADJ_P <= threshold) for recurrence counting
     sig_long = all_long[all_long["IS_SIG"]].copy()
     if sig_long.empty:
         recurrence_df = pd.DataFrame(columns=["QUERY_SNP", "N_TRAITS", "TRAITS"])
     else:
-        recurrence_df = (
-            sig_long.groupby("QUERY_SNP", as_index=False)
-            .agg(
-                N_TRAITS=("TRAIT", "nunique"),
-                TRAITS=("TRAIT", lambda s: ", ".join(sorted(set(s)))),
-            )
+        recurrence_df = sig_long.groupby("QUERY_SNP", as_index=False).agg(
+            N_TRAITS=("TRAIT", "nunique"),
+            TRAITS=("TRAIT", lambda s: ", ".join(sorted(set(s)))),
         )
 
-    # Aggregate metadata for SNPs that pass significance in at least 1 trait (or all if min_traits <= 0)
     all_raw_concat = pd.concat(raw_frames, ignore_index=True)
     if min_traits >= 1:
         sig_snps_set = set(recurrence_df["QUERY_SNP"].unique())
@@ -289,14 +268,10 @@ def run_cross_trait_asm_analysis(
         raw_subset = all_raw_concat
 
     meta_agg = aggregate_snp_metadata(raw_subset)
-    if meta_agg.empty:
-        full_matrix = pd.merge(meta_agg, recurrence_df, on="QUERY_SNP", how="left")
-    else:
-        full_matrix = pd.merge(meta_agg, recurrence_df, on="QUERY_SNP", how="left")
+    full_matrix = pd.merge(meta_agg, recurrence_df, on="QUERY_SNP", how="left")
     full_matrix["N_TRAITS"] = full_matrix["N_TRAITS"].fillna(0).astype(int)
     full_matrix["TRAITS"] = full_matrix["TRAITS"].fillna("None")
 
-    # Attach dynamic per-trait columns: BETA_{T} and ADJ_P_{T} (significant hits)
     dynamic_cols = []
     adj_p_cols = []
     for trait in traits:
@@ -316,10 +291,8 @@ def run_cross_trait_asm_analysis(
         full_matrix["MIN_DISTANCE_TO_TSS"], errors="coerce"
     ).astype("Int64")
 
-    # Distribution of N_TRAITS across all SNPs with N_TRAITS >= 1
     sig_any = full_matrix[full_matrix["N_TRAITS"] >= 1].copy()
 
-    # Filter for N_TRAITS >= min_traits
     filtered = full_matrix[full_matrix["N_TRAITS"] >= min_traits].copy()
     if not filtered.empty and adj_p_cols:
         filtered["_MEDIAN_ADJ_P"] = filtered[adj_p_cols].median(axis=1, skipna=True)
@@ -495,4 +468,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

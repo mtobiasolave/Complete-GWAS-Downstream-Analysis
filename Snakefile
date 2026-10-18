@@ -16,13 +16,51 @@ if os.path.exists("config_local.yaml"):
     configfile: "config_local.yaml"
 
 # ----- TRAIT & PAIR DETECTION ----- #
-# 1. Detect traits from config['traits'] (with automatic fallback to raw_data folder)
-DISCOVERED_TRAITS, = glob_wildcards("data/raw_data/{trait}_gwas.txt")
-TRAITS = config.get("traits", DISCOVERED_TRAITS) or DISCOVERED_TRAITS
+# 1. Automatically discover all GWAS summary statistics files in data/raw_data/
+def discover_raw_gwas(raw_dir="data/raw_data"):
+    """Scan data/raw_data/ and map each trait name to its relative file path."""
+    discovered = {}
+    if not os.path.isdir(raw_dir):
+        return discovered
+    suffixes = (
+        "_gwas.txt.gz",
+        "_gwas.tsv.gz",
+        "_gwas.txt",
+        "_gwas.tsv",
+        ".sumstats.gz",
+        ".txt.gz",
+        ".tsv.gz",
+        ".txt",
+        ".tsv",
+    )
+    for fname in sorted(os.listdir(raw_dir)):
+        if fname.startswith("."):
+            continue
+        fpath = f"{raw_dir}/{fname}"
+        if not os.path.isfile(fpath):
+            continue
+        for suf in suffixes:
+            if fname.endswith(suf):
+                trait_name = fname[: -len(suf)]
+                if trait_name:
+                    discovered[trait_name] = fpath
+                break
+    return discovered
+
+DISCOVERED_GWAS = discover_raw_gwas("data/raw_data")
+CONFIG_GWAS = config.get("gwas_sumstats", {}) or {}
+for t_name, t_path in CONFIG_GWAS.items():
+    if t_name not in DISCOVERED_GWAS and os.path.exists(t_path):
+        DISCOVERED_GWAS[t_name] = t_path
+
+# Always include all GWAS files present in data/raw_data/ (plus any extra configured traits)
+TRAITS = sorted(set(DISCOVERED_GWAS.keys()) | set(config.get("traits", []) or []))
 
 def get_gwas_input(wildcards):
-    """Resolve raw GWAS summary statistics path for {trait} from config or default pattern."""
-    gwas_map = config.get("gwas_sumstats", {})
+    """Resolve raw GWAS summary statistics path for {trait} from discovered files or config."""
+    if wildcards.trait in DISCOVERED_GWAS:
+        return DISCOVERED_GWAS[wildcards.trait]
+    gwas_map = config.get("gwas_sumstats", {}) or {}
     return gwas_map.get(wildcards.trait, f"data/raw_data/{wildcards.trait}_gwas.txt")
 
 # 2. Automatically generate every unique pair (e.g., A_B, A_C, B_C)
@@ -179,6 +217,7 @@ rule munge_sumstats:
     output:
         "results/munged/{trait}.sumstats.gz"
     priority: 50
+    threads: 1
     params:
         # LDSC expects the output prefix without the '.sumstats.gz' extension
         out_prefix="results/munged/{trait}",
@@ -210,11 +249,11 @@ rule munge_sumstats:
 # ------------------------------------------------------------------------------
 rule ldsc_h2:
     input:
-        sumstats="results/munged/{trait}.sumstats.gz",
-        all_munged=expand("results/munged/{t}.sumstats.gz", t=TRAITS)
+        sumstats="results/munged/{trait}.sumstats.gz"
     output:
         "results/ldsc_h2/{trait}_h2.log"
     priority: 20
+    threads: 1
     params:
         out_prefix="results/ldsc_h2/{trait}_h2",
         ld_ref=config.get("ld_ref", "data/reference/LDscores"),
@@ -244,13 +283,12 @@ rule ldsc_h2:
 rule ldsc_rg:
     input:
         # Using wildcards here allows you to pair any two traits dynamically
-        # all_munged ensures all traits finish Step 1 (munge) before Step 2 starts
         trait1="results/munged/{trait1}.sumstats.gz",
-        trait2="results/munged/{trait2}.sumstats.gz",
-        all_munged=expand("results/munged/{t}.sumstats.gz", t=TRAITS)
+        trait2="results/munged/{trait2}.sumstats.gz"
     output:
         "results/ldsc_rg/{trait1}_{trait2}.log"
     priority: 20
+    threads: 1
     params:
         out_prefix="results/ldsc_rg/{trait1}_{trait2}",
         ld_ref=config.get("ld_ref", "data/reference/LDscores"),
@@ -284,6 +322,7 @@ rule plot_heatmap:
         logs=expand("results/ldsc_rg/{pair}.log", pair=PAIRS)
     output:
         "results/figures/rg_heatmap.pdf"
+    threads: 1
     params:
         env_setup=lambda wildcards: get_env_setup("snakemake_env"),
         python_bin=get_python_bin(),
@@ -309,6 +348,7 @@ rule plot_network:
         logs=expand("results/ldsc_rg/{pair}.log", pair=PAIRS)
     output:
         "results/figures/rg_network.pdf"
+    threads: 1
     params:
         env_setup=lambda wildcards: get_env_setup("snakemake_env"),
         python_bin=get_python_bin(),
@@ -336,6 +376,7 @@ rule methylation_overlap:
     output:
         overlap_ids="results/methylation/{meth}_{trait}_overlap.txt",
         overlap_full="results/methylation/{meth}_{trait}_overlap_fullheaders.txt"
+    threads: 1
     params:
         env_setup=lambda wildcards: get_env_setup("snakemake_env"),
         python_bin=get_python_bin(),
@@ -362,6 +403,7 @@ rule overlap_dna_asm:
         mapping_table=config["methylation"]["dna_mapping_table"]
     output:
         "results/methylation/dna_asm_{trait}_gwas_overlap.tsv"
+    threads: 1
     params:
         env_setup=lambda wildcards: get_env_setup("snakemake_env"),
         python_bin=get_python_bin(),
@@ -391,6 +433,7 @@ rule map_cpg_to_tss_genes:
         gene_tss=config["methylation"]["gene_tss"]
     output:
         "results/methylation/dna_asm_{trait}_cpg_gene_tss_matches.tsv"
+    threads: 1
     params:
         tss_distance_cutoff=config["methylation"].get("tss_distance_cutoff", 5000),
         env_setup=lambda wildcards: get_env_setup("snakemake_env"),
@@ -421,6 +464,7 @@ rule lookup_gtex_brain_eqtls:
         overlap="results/methylation/dna_asm_{trait}_gwas_overlap.tsv"
     output:
         "results/methylation/dna_asm_{trait}_gtex_brain_eqtls.tsv"
+    threads: 1
     params:
         tissues=" ".join(config.get("gtex", {}).get("brain_tissues", [])),
         p_threshold=config.get("gtex", {}).get("p_threshold", 0.05),
@@ -457,6 +501,7 @@ rule compare_tss_and_gtex_genes:
     output:
         full="results/methylation/dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv",
         concordant="results/methylation/dna_asm_{trait}_concordant_genes_summary.tsv"
+    threads: 1
     params:
         trait="{trait}",
         env_setup=lambda wildcards: get_env_setup("snakemake_env"),
@@ -487,6 +532,7 @@ rule cross_trait_asm_summary:
         expand("results/methylation/dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv", trait=TRAITS)
     output:
         tsv="results/methylation/comparisons/cross_trait_asm_recurrent_snps.tsv"
+    threads: 1
     params:
         method=config.get("cross_trait", {}).get("fdr_method", "storey"),
         k=config.get("cross_trait", {}).get("min_recurrence", 2),
@@ -523,6 +569,7 @@ rule cross_trait_rna_m6a_summary:
         summary="results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps_summary.tsv",
         heatmap_pdf="results/figures/cross_trait_rna_m6a_recurrent_snps_annotated_effect_heatmap.pdf",
         heatmap_png="results/figures/cross_trait_rna_m6a_recurrent_snps_annotated_effect_heatmap.png"
+    threads: 1
     params:
         method=config.get("cross_trait", {}).get("fdr_method", "storey"),
         k=config.get("cross_trait", {}).get("min_recurrence", 2),

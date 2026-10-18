@@ -4,9 +4,9 @@ Step 5b: Map Overlapping DNA ASM CpGs to hg19 Coordinates and GENCODE v19 Gene T
 
 1. Merges `cpg_coordinates_hg19.tsv` with `dna_asm_gwas_overlap.tsv` on `CPG_ID`.
 2. Standardizes chromosome notation across tables (preserving `chr` prefix consistently).
-3. Queries `gencode_v19_gene_tss.tsv` on the same chromosome, computing:
+3. Queries `gencode_v19_gene_tss.tsv` on the same chromosome using binary-search interval
+   bounds (`np.searchsorted` on `[CPG_POS - cutoff, CPG_POS + cutoff]`), computing:
        DISTANCE_TO_TSS = |CPG_POS - TSS|
-   and filtering for DISTANCE_TO_TSS <= tss_distance_cutoff (default 5,000 bp).
 4. Retains multiple genes within 5 kb in tidy long format, and retains CpGs without any
    gene within 5 kb using GENE_SYMBOL = "NONE_WITHIN_5KB" and DISTANCE_TO_TSS = NA.
 
@@ -17,22 +17,11 @@ Output Columns:
 
 import argparse
 import os
-import sys
 
 import numpy as np
 import pandas as pd
 
-
-def standardize_chr(series: pd.Series) -> pd.Series:
-    """Standardize chromosome labels to consistently include the 'chr' prefix (e.g., 'chr16')."""
-    s = series.astype(str).str.strip()
-    is_na = series.isna() | s.isin(["", "nan", "None", "NA", "<NA>"])
-    normalized = s.apply(
-        lambda val: val if val.lower().startswith("chr") else f"chr{val}"
-    )
-    # Ensure canonical lowercase 'chr' prefix
-    normalized = normalized.str.replace(r"^CHR", "chr", regex=True)
-    return normalized.where(~is_na, other=pd.NA)
+from common_utils import standardize_chr
 
 
 def map_cpg_to_tss(
@@ -56,12 +45,12 @@ def map_cpg_to_tss(
 
     # Clean and standardize CpG coordinate table
     cpg_df["CPG_ID"] = cpg_df["CPG_ID"].astype(str).str.strip()
-    cpg_df["CHR"] = standardize_chr(cpg_df["CHR"])
+    cpg_df["CHR"] = standardize_chr(cpg_df["CHR"]).replace("", pd.NA)
     cpg_df["CPG_POS"] = pd.to_numeric(cpg_df["CPG_POS"], errors="coerce").astype("Int64")
     cpg_df = cpg_df[["CPG_ID", "CHR", "CPG_POS"]].drop_duplicates(subset=["CPG_ID"])
 
     # Clean and standardize GENCODE v19 TSS table
-    tss_df["CHR"] = standardize_chr(tss_df["CHR"])
+    tss_df["CHR"] = standardize_chr(tss_df["CHR"]).replace("", pd.NA)
     tss_df["GENE_SYMBOL"] = tss_df["GENE_SYMBOL"].astype(str).str.strip()
     tss_df["STRAND"] = tss_df["STRAND"].astype(str).str.strip()
     tss_df["TSS"] = pd.to_numeric(tss_df["TSS"], errors="coerce").astype("Int64")
@@ -74,7 +63,7 @@ def map_cpg_to_tss(
     unique_cpgs = pd.DataFrame({"CPG_ID": overlap_df["CPG_ID"].dropna().unique()})
     cpg_mapped = pd.merge(unique_cpgs, cpg_df, on="CPG_ID", how="left")
 
-    # Vectorized per-chromosome TSS distance calculation on unique CpGs
+    # Binary-search interval join per chromosome: [CPG_POS - cutoff, CPG_POS + cutoff]
     matched_chunks = []
     valid_cpgs = cpg_mapped.dropna(subset=["CHR", "CPG_POS"])
 
@@ -83,12 +72,41 @@ def map_cpg_to_tss(
         if tss_chr_group.empty:
             continue
 
-        merged_chr = pd.merge(cpg_chr_group, tss_chr_group, on="CHR", how="inner")
-        dist = (merged_chr["CPG_POS"] - merged_chr["TSS"]).abs()
-        within_cutoff = merged_chr[dist <= cutoff].copy()
-        if not within_cutoff.empty:
-            within_cutoff["DISTANCE_TO_TSS"] = dist[dist <= cutoff].astype("Int64")
-            matched_chunks.append(within_cutoff)
+        tss_sorted = tss_chr_group.sort_values("TSS", kind="mergesort").reset_index(drop=True)
+        tss_pos = tss_sorted["TSS"].to_numpy(dtype=np.int64)
+        cpg_pos = cpg_chr_group["CPG_POS"].to_numpy(dtype=np.int64)
+
+        left_idx = np.searchsorted(tss_pos, cpg_pos - cutoff, side="left")
+        right_idx = np.searchsorted(tss_pos, cpg_pos + cutoff, side="right")
+        counts = right_idx - left_idx
+        has_match = counts > 0
+
+        if not np.any(has_match):
+            continue
+
+        cpg_idx = np.repeat(np.flatnonzero(has_match), counts[has_match])
+        tss_idx = np.concatenate(
+            [np.arange(l, r, dtype=np.int64) for l, r in zip(left_idx[has_match], right_idx[has_match])]
+        )
+
+        cpg_part = cpg_chr_group.iloc[cpg_idx].reset_index(drop=True)
+        tss_part = tss_sorted.iloc[tss_idx].reset_index(drop=True)
+
+        dist = np.abs(
+            cpg_part["CPG_POS"].to_numpy(dtype=np.int64) - tss_part["TSS"].to_numpy(dtype=np.int64)
+        )
+
+        within_cutoff = pd.DataFrame({
+            "CPG_ID": cpg_part["CPG_ID"],
+            "CHR": cpg_part["CHR"],
+            "CPG_POS": cpg_part["CPG_POS"].astype("Int64"),
+            "GENE_SYMBOL": tss_part["GENE_SYMBOL"],
+            "STRAND": tss_part["STRAND"],
+            "TSS": tss_part["TSS"].astype("Int64"),
+            "DISTANCE_TO_TSS": pd.Series(dist, dtype="Int64"),
+            "BIOTYPE": tss_part["BIOTYPE"],
+        })
+        matched_chunks.append(within_cutoff)
 
     cpg_tss_cols = [
         "CPG_ID",
@@ -126,7 +144,6 @@ def map_cpg_to_tss(
     else:
         all_cpg_tss = matched_cpg_tss
 
-    # Ensure nullable integer types are preserved after concat
     all_cpg_tss["CPG_POS"] = pd.to_numeric(all_cpg_tss["CPG_POS"], errors="coerce").astype("Int64")
     all_cpg_tss["TSS"] = pd.to_numeric(all_cpg_tss["TSS"], errors="coerce").astype("Int64")
     all_cpg_tss["DISTANCE_TO_TSS"] = pd.to_numeric(
@@ -219,4 +236,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

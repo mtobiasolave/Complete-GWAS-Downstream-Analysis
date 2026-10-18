@@ -40,7 +40,15 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 try:
     from compare_overlap_snps import discover_available_files, compare_and_filter
-    from annotate_snps_genes import annotate_file, DEFAULT_CACHE_FILE
+    from annotate_snps_genes import (
+        annotate_file,
+        batch_get_ensembl_genes,
+        batch_get_gtex_brain_eqtls,
+        DEFAULT_CACHE_FILE,
+        clean_rsid,
+        find_common_genes,
+    )
+    from common_utils import create_http_session, load_json_cache, save_json_cache
     from interactive_cross_trait_asm import (
         discover_trait_comparison_files,
         run_cross_trait_asm_analysis,
@@ -49,6 +57,13 @@ except ImportError:
     discover_available_files = None
     compare_and_filter = None
     annotate_file = None
+    batch_get_ensembl_genes = None
+    batch_get_gtex_brain_eqtls = None
+    clean_rsid = None
+    find_common_genes = None
+    create_http_session = None
+    load_json_cache = None
+    save_json_cache = None
     discover_trait_comparison_files = None
     run_cross_trait_asm_analysis = None
     DEFAULT_CACHE_FILE = str(PROJECT_ROOT / "results/methylation/.api_cache.json")
@@ -219,7 +234,161 @@ def load_data(summary_path: str, annotated_path: str):
     df_wide.columns = [c.strip() for c in df_wide.columns]
 
     if "Num_Sig_Traits" in df_summary.columns:
-        df_summary["Num_Sig_Traits"] = pd.to_numeric(df_summary["Num_Sig_Traits"], errors="coerce").fillna(0).astype(int)
+        df_summary["Num_Sig_Traits"] = (
+            pd.to_numeric(df_summary["Num_Sig_Traits"], errors="coerce").fillna(0).astype(int)
+        )
+    if "Num_Sig_Traits" in df_wide.columns:
+        df_wide["Num_Sig_Traits"] = (
+            pd.to_numeric(df_wide["Num_Sig_Traits"], errors="coerce").fillna(0).astype(int)
+        )
+
+    # If the pre-computed file was generated with min_k >= 2, dynamically augment with k=1
+    # variants from the raw RNA_m6A overlap files so lowering the slider to k=1 works seamlessly.
+    min_k_in_file = int(df_summary["Num_Sig_Traits"].min()) if not df_summary.empty else 2
+    if (
+        min_k_in_file > 1
+        and discover_available_files is not None
+        and compare_and_filter is not None
+    ):
+        try:
+            method = "storey"
+            if "_bh" in Path(summary_path).name.lower():
+                method = "bh"
+            else:
+                with open(summary_path, "r", encoding="utf-8") as fh:
+                    first_line = fh.readline()
+                if "BH FDR" in first_line:
+                    method = "bh"
+
+            all_recs = discover_available_files()
+            rna_recs = [r for r in all_recs if r["meth"] in ("RNA_m6A", "RNAm6A")]
+            traits_in_wide = {
+                c[len("FDR_") :] for c in df_wide.columns if c.startswith("FDR_")
+            }
+            if traits_in_wide:
+                matched_recs = [r for r in rna_recs if r["trait"] in traits_in_wide]
+                if matched_recs:
+                    rna_recs = matched_recs
+
+            if len(rna_recs) >= 2:
+                tmp_k1_path = str(COMPARISONS_DIR / f".tmp_k1_{method}_rna_m6a.tsv")
+                _, k1_wide = compare_and_filter(
+                    rna_recs, tmp_k1_path, min_k=1, method=method
+                )
+                try:
+                    if os.path.exists(tmp_k1_path):
+                        os.remove(tmp_k1_path)
+                except OSError:
+                    pass
+
+                if not k1_wide.empty:
+                    existing_ens = (
+                        df_wide.set_index("SNP")["Ensembl_Genes"].to_dict()
+                        if "Ensembl_Genes" in df_wide.columns
+                        else {}
+                    )
+                    existing_gtex = (
+                        df_wide.set_index("SNP")["GTEx_Brain_eQTL_Genes"].to_dict()
+                        if "GTEx_Brain_eQTL_Genes" in df_wide.columns
+                        else {}
+                    )
+                    existing_common = (
+                        df_summary.set_index("SNP")["Common_Genes"].to_dict()
+                        if "Common_Genes" in df_summary.columns
+                        else {}
+                    )
+
+                    api_cache = (
+                        load_json_cache(str(DEFAULT_CACHE_FILE))
+                        if load_json_cache is not None
+                        else {}
+                    )
+
+                    # Batch-annotate any k=1 SNPs missing from both df_wide and .api_cache.json
+                    if (
+                        batch_get_ensembl_genes is not None
+                        and batch_get_gtex_brain_eqtls is not None
+                        and create_http_session is not None
+                    ):
+                        missing_ens = []
+                        missing_gtex = []
+                        for snp in k1_wide["SNP"].astype(str):
+                            if snp in existing_ens and snp in existing_gtex:
+                                continue
+                            c_rsid = clean_rsid(snp) if clean_rsid else snp.lower()
+                            if not c_rsid:
+                                continue
+                            entry = api_cache.get(c_rsid, {}) if isinstance(api_cache, dict) else {}
+                            if not isinstance(entry, dict) or entry.get("ensembl") in (None, ""):
+                                missing_ens.append(c_rsid)
+                            if not isinstance(entry, dict) or entry.get("gtex") is None:
+                                missing_gtex.append(c_rsid)
+
+                        if missing_ens or missing_gtex:
+                            http_sess = create_http_session(pool_size=24)
+                            if missing_ens:
+                                ens_fetched = batch_get_ensembl_genes(missing_ens, http_sess)
+                                for r_id, val in ens_fetched.items():
+                                    if r_id in api_cache and isinstance(api_cache[r_id], dict):
+                                        api_cache[r_id]["ensembl"] = val
+                                    else:
+                                        api_cache[r_id] = {"ensembl": val, "gtex": None}
+                            if missing_gtex:
+                                gtex_fetched = batch_get_gtex_brain_eqtls(
+                                    missing_gtex, http_sess, max_workers=16
+                                )
+                                for r_id, val in gtex_fetched.items():
+                                    if r_id in api_cache and isinstance(api_cache[r_id], dict):
+                                        api_cache[r_id]["gtex"] = val
+                                    else:
+                                        api_cache[r_id] = {"ensembl": "None", "gtex": val}
+                            if save_json_cache is not None:
+                                save_json_cache(str(DEFAULT_CACHE_FILE), api_cache)
+
+                    ens_col = []
+                    gtex_col = []
+                    common_col = []
+                    for snp in k1_wide["SNP"].astype(str):
+                        e_val = existing_ens.get(snp)
+                        g_val = existing_gtex.get(snp)
+                        c_val = existing_common.get(snp)
+
+                        if e_val is None or g_val is None:
+                            c_rsid = clean_rsid(snp) if clean_rsid else snp.lower()
+                            cached_entry = api_cache.get(c_rsid, {}) if isinstance(api_cache, dict) else {}
+                            if isinstance(cached_entry, dict):
+                                if e_val is None:
+                                    e_val = cached_entry.get("ensembl") or "None"
+                                if g_val is None:
+                                    g_val = cached_entry.get("gtex") or "None"
+
+                        e_val = e_val if e_val is not None else "None"
+                        g_val = g_val if g_val is not None else "None"
+                        if c_val is None:
+                            c_val = (
+                                find_common_genes(e_val, g_val)
+                                if find_common_genes is not None
+                                else "No match"
+                            )
+
+                        ens_col.append(e_val)
+                        gtex_col.append(g_val)
+                        common_col.append(c_val)
+
+                    k1_wide["Ensembl_Genes"] = ens_col
+                    k1_wide["GTEx_Brain_eQTL_Genes"] = gtex_col
+                    df_wide = k1_wide
+                    df_summary = pd.DataFrame({
+                        "SNP": k1_wide["SNP"],
+                        "Num_Sig_Traits": pd.to_numeric(
+                            k1_wide["Num_Sig_Traits"], errors="coerce"
+                        )
+                        .fillna(0)
+                        .astype(int),
+                        "Common_Genes": common_col,
+                    })
+        except Exception:
+            pass
 
     df_long, debug_info = reshape_wide_to_long(df_wide)
     return df_summary, df_wide, df_long, debug_info
@@ -511,12 +680,30 @@ with tab_explore:
             export_metric = "effect"
 
         if not filtered_long.empty and len(valid_snps) > 0:
-            heatmap_df = filtered_long.pivot_table(
-                index="Trait",
-                columns="SNP",
-                values=active_val_col,
-                aggfunc="first"
-            ).fillna(0)
+            if len(valid_snps) > 50:
+                max_rna_plot_snps = st.slider(
+                    "Max Top Recurrent Variants to Display in Heatmap:",
+                    min_value=10,
+                    max_value=min(200, len(valid_snps)),
+                    value=min(50, len(valid_snps)),
+                    step=10,
+                    key="rna_max_heatmap_snps",
+                )
+                plot_snps = valid_snps[:max_rna_plot_snps]
+            else:
+                plot_snps = valid_snps
+
+            plot_long = filtered_long[filtered_long["SNP"].isin(plot_snps)]
+            heatmap_df = (
+                plot_long.pivot_table(
+                    index="Trait",
+                    columns="SNP",
+                    values=active_val_col,
+                    aggfunc="first",
+                )
+                .reindex(columns=plot_snps)
+                .fillna(0)
+            )
 
             heatmap_df = heatmap_df.replace([np.inf, -np.inf], 0)
 

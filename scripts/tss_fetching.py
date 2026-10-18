@@ -1,97 +1,91 @@
-# Script to extract TSS positions from GENCODE GTF file and save as a lightweight TSV for downstream analysis.
+"""Extract transcript-level TSS positions from a GENCODE GTF file into a lightweight TSV.
 
+Retained as a standalone reference preprocessing utility.
+"""
+
+import argparse
 import csv
 import gzip
 import os
 import re
 
-# Update paths to match your folder structure
+from common_utils import is_gzipped
+
 GTF_INPUT = "data/annotations/gencode.v19.annotation.gtf_withproteinids"
 TSV_OUTPUT = "data/annotations/gencode_v19_gene_tss.tsv"
 
-# Regex patterns for GTF attributes
-re_gene_name = re.compile(r'gene_name "([^"]+)"')
-re_gene_type = re.compile(r'(?:gene_type|gene_biotype) "([^"]+)"')
-re_gene_id = re.compile(r'gene_id "([^"]+)"')
+RE_GENE_NAME = re.compile(r'gene_name "([^"]+)"')
+RE_GENE_TYPE = re.compile(r'(?:gene_type|gene_biotype) "([^"]+)"')
+RE_GENE_ID = re.compile(r'gene_id "([^"]+)"')
 
 
-def is_gzipped(filepath):
-  with open(filepath, "rb") as test_f:
-    return test_f.read(2) == b"\x1f\x8b"
+def extract_tss(gtf_path: str, output_path: str) -> None:
+    """Parse transcript features from GTF and write unique (CHR, GENE_SYMBOL, TSS) rows."""
+    gzipped = is_gzipped(gtf_path)
+    open_fn = gzip.open if gzipped else open
+    mode = "rt" if gzipped else "r"
 
+    records = []
+    seen = set()
 
-def extract_tss(gtf_path, output_path):
-  open_fn = gzip.open if is_gzipped(gtf_path) else open
-  mode = "rt" if is_gzipped(gtf_path) else "r"
+    print(f"Reading {gtf_path}...")
+    with open_fn(gtf_path, mode, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
 
-  records = []
-  seen = set()
+            fields = line.strip().split("\t")
+            if len(fields) < 9 or fields[2] != "transcript":
+                continue
 
-  print(f"Reading {gtf_path}...")
-  with open_fn(gtf_path, mode, encoding="utf-8") as f:
-    for line in f:
-      if line.startswith("#"):
-        continue
+            chrom = fields[0]
+            start = int(fields[3])
+            end = int(fields[4])
+            strand = fields[6]
+            attributes = fields[8]
 
-      fields = line.strip().split("\t")
-      if len(fields) < 9:
-        continue
+            tss = start if strand == "+" else end
 
-      feature = fields[2]
-      # Using 'transcript' level ensures all alternative promoter TSSs are captured
-      if feature != "transcript":
-        continue
+            match_name = RE_GENE_NAME.search(attributes)
+            match_type = RE_GENE_TYPE.search(attributes)
+            match_id = RE_GENE_ID.search(attributes)
 
-      chrom = fields[0]  # e.g., 'chr1'
-      start = int(fields[3])  # 1-based start
-      end = int(fields[4])  # 1-based end
-      strand = fields[6]  # '+' or '-'
-      attributes = fields[8]
+            gene_symbol = (
+                match_name.group(1)
+                if match_name
+                else (match_id.group(1) if match_id else "UNKNOWN")
+            )
+            biotype = match_type.group(1) if match_type else "unknown"
 
-      # Strand-aware TSS calculation
-      tss = start if strand == "+" else end
+            key = (chrom, gene_symbol, tss)
+            if key not in seen:
+                seen.add(key)
+                records.append({
+                    "CHR": chrom,
+                    "GENE_SYMBOL": gene_symbol,
+                    "STRAND": strand,
+                    "TSS": tss,
+                    "BIOTYPE": biotype,
+                })
 
-      # Extract gene symbol and biotype
-      match_name = re_gene_name.search(attributes)
-      match_type = re_gene_type.search(attributes)
-      match_id = re_gene_id.search(attributes)
+    records.sort(key=lambda x: (x["CHR"], x["TSS"], x["GENE_SYMBOL"]))
 
-      gene_symbol = (
-          match_name.group(1)
-          if match_name
-          else (match_id.group(1) if match_id else "UNKNOWN")
-      )
-      biotype = match_type.group(1) if match_type else "unknown"
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8") as out_f:
+        writer = csv.DictWriter(
+            out_f,
+            fieldnames=["CHR", "GENE_SYMBOL", "STRAND", "TSS", "BIOTYPE"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerows(records)
 
-      # Store unique (CHR, GENE_SYMBOL, TSS) tuples
-      key = (chrom, gene_symbol, tss)
-      if key not in seen:
-        seen.add(key)
-        records.append({
-            "CHR": chrom,
-            "GENE_SYMBOL": gene_symbol,
-            "STRAND": strand,
-            "TSS": tss,
-            "BIOTYPE": biotype,
-        })
-
-  # Sort by chromosome and position
-  records.sort(key=lambda x: (x["CHR"], x["TSS"], x["GENE_SYMBOL"]))
-
-  # Write clean, lightweight reference TSV
-  os.makedirs(os.path.dirname(output_path), exist_ok=True)
-  with open(output_path, "w", newline="", encoding="utf-8") as out_f:
-    writer = csv.DictWriter(
-        out_f,
-        fieldnames=["CHR", "GENE_SYMBOL", "STRAND", "TSS", "BIOTYPE"],
-        delimiter="\t",
-    )
-    writer.writeheader()
-    writer.writerows(records)
-
-  print(f"Extraction complete! {len(records)} unique TSS positions saved to:")
-  print(f" -> {output_path}")
+    print(f"Extraction complete! {len(records)} unique TSS positions saved to: {output_path}")
 
 
 if __name__ == "__main__":
-  extract_tss(GTF_INPUT, TSV_OUTPUT)
+    parser = argparse.ArgumentParser(description="Extract GENCODE TSS reference TSV from GTF.")
+    parser.add_argument("--input", default=GTF_INPUT, help="Path to input GENCODE GTF.")
+    parser.add_argument("--output", default=TSV_OUTPUT, help="Path to output TSS TSV.")
+    args = parser.parse_args()
+    extract_tss(args.input, args.output)

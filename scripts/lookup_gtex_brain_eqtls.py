@@ -16,97 +16,25 @@ Key Improvements:
 """
 
 import argparse
-import json
 import os
-import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
-
-try:
-    from compare_overlap_snps import storey_qvalues
-except ImportError:
-    storey_qvalues = None
-
-DEFAULT_BRAIN_TISSUES = [
-    "Brain_Amygdala",
-    "Brain_Anterior_cingulate_cortex_BA24",
-    "Brain_Caudate_basal_ganglia",
-    "Brain_Cerebellar_Hemisphere",
-    "Brain_Cerebellum",
-    "Brain_Cortex",
-    "Brain_Frontal_Cortex_BA9",
-    "Brain_Hippocampus",
-    "Brain_Hypothalamus",
-    "Brain_Nucleus_accumbens_basal_ganglia",
-    "Brain_Putamen_basal_ganglia",
-    "Brain_Spinal_cord_cervical_c-1",
-    "Brain_Substantia_nigra",
-]
-
-TISSUE_TYPO_FIXES = {
-    "Brain_Amydgala": "Brain_Amygdala",
-}
+from common_utils import (
+    DEFAULT_BRAIN_TISSUES,
+    TISSUE_TYPO_FIXES,
+    create_http_session,
+    load_json_cache,
+    normalize_tissues,
+    save_json_cache,
+    storey_qvalues,
+)
 
 DEFAULT_CACHE_FILE = "results/methylation/.gtex_eqtl_cache.json"
-cache_lock = threading.Lock()
-
-
-def normalize_tissues(tissues: list) -> list:
-    norm = []
-    for t in tissues:
-        t_clean = str(t).strip()
-        t_clean = TISSUE_TYPO_FIXES.get(t_clean, t_clean)
-        if t_clean and t_clean not in norm:
-            norm.append(t_clean)
-    return norm
-
-
-def load_gtex_cache(cache_path: str) -> dict:
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception as exc:
-            print(f"[lookup_gtex] Warning: Could not read cache {cache_path} ({exc}).")
-    return {}
-
-
-def save_gtex_cache(cache: dict, cache_path: str) -> None:
-    if not cache:
-        return
-    try:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        # Merge with any updates written by concurrent processes before saving
-        existing = load_gtex_cache(cache_path)
-        existing.update(cache)
-        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2)
-        os.replace(tmp_path, cache_path)
-    except Exception as exc:
-        print(f"[lookup_gtex] Warning: Could not save cache to {cache_path} ({exc}).")
-
-
-def create_http_session(pool_size: int = 20) -> requests.Session:
-    session = requests.Session()
-    adapter = HTTPAdapter(
-        pool_connections=pool_size, pool_maxsize=pool_size, max_retries=3
-    )
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
 
 
 def fetch_variant_id(rsid: str, session: requests.Session) -> tuple:
@@ -190,8 +118,8 @@ def select_candidate_snps(
     unique_df = unique_df.dropna(subset=["QUERY_SNP", p_col])
 
     mask_p = unique_df[p_col] <= gwas_p_threshold
-    if storey_qvalues is not None and len(unique_df) > 10:
-        qvals, _ = storey_qvalues(unique_df[p_col].values)
+    if len(unique_df) > 10:
+        qvals = storey_qvalues(unique_df[p_col].to_numpy(dtype=float))
         mask_q = qvals <= fdr_threshold
         selected = unique_df[mask_p | mask_q]
     else:
@@ -225,7 +153,7 @@ def run_lookup_gtex(
         f"unique QUERY_SNPs selected (GWAS P <= {gwas_p_threshold} or Storey q <= 0.05)."
     )
 
-    cache = load_gtex_cache(cache_path)
+    cache = load_json_cache(cache_path)
     uncached_snps = [s for s in candidate_snps if s not in cache]
     print(
         f"[lookup_gtex] Cache hits: {len(candidate_snps) - len(uncached_snps):,} | "
@@ -237,7 +165,6 @@ def run_lookup_gtex(
         rsid_to_vid = {}
         vid_to_rsids = {}
 
-        # 1. Resolve rsID -> GTEx variantId in parallel
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(fetch_variant_id, rsid, session): rsid
@@ -249,11 +176,9 @@ def run_lookup_gtex(
                 if vid:
                     vid_to_rsids.setdefault(vid, []).append(rsid)
 
-        # Initialize empty hit lists in cache for all queried SNPs
         for rsid in uncached_snps:
             cache[rsid] = []
 
-        # 2. Query singleTissueEqtl in batches of 40 variantIds
         all_vids = list(vid_to_rsids.keys())
         batch_size = 40
         batches = [
@@ -281,19 +206,18 @@ def run_lookup_gtex(
                         if rsid in cache:
                             cache[rsid].append(hit_record)
 
-        save_gtex_cache(cache, cache_path)
+        save_json_cache(cache_path, cache)
         print(f"[lookup_gtex] Updated persistent GTEx cache at {cache_path}")
 
-    # 3. Collect and aggregate eQTL hits across all candidate SNPs
     raw_rows = []
-    # Also include any already-cached SNPs present in overlap_df even if P > gwas_p_threshold
     all_overlap_snps = overlap_df["QUERY_SNP"].dropna().unique()
     for rsid in all_overlap_snps:
         hits = cache.get(rsid, [])
         if not isinstance(hits, list):
             continue
         for h in hits:
-            tissue = TISSUE_TYPO_FIXES.get(str(h.get("tissueSiteDetailId", "")), str(h.get("tissueSiteDetailId", "")))
+            raw_tissue = str(h.get("tissueSiteDetailId", ""))
+            tissue = TISSUE_TYPO_FIXES.get(raw_tissue, raw_tissue)
             gene = str(h.get("geneSymbol", "")).strip()
             pval = pd.to_numeric(h.get("pValue"), errors="coerce")
             slope = pd.to_numeric(h.get("nes"), errors="coerce")
@@ -326,7 +250,6 @@ def run_lookup_gtex(
         agg_df = pd.DataFrame(columns=out_cols)
     else:
         hits_df = pd.DataFrame(raw_rows)
-        # Deduplicate identical (QUERY_SNP, GTEX_GENE_SYMBOL, TISSUE) keeping lowest p-value
         hits_df = hits_df.sort_values("PVALUE", ascending=True).drop_duplicates(
             subset=["QUERY_SNP", "GTEX_GENE_SYMBOL", "TISSUE"]
         )
@@ -402,4 +325,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

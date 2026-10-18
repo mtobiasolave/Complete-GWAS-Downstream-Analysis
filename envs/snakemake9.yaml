@@ -1,5 +1,5 @@
 # ==============================================================================
-# Snakemake 9 HPC Environment Specification
+# Snakemake 9 HPC & Local Environment Specification
 # Create environment with:
 #   conda env create -f envs/snakemake9.yaml
 #   conda activate snakemake9_env
@@ -21,7 +21,9 @@ dependencies:
   - matplotlib >=3.7
   - seaborn >=0.12
   - requests >=2.30
+  - urllib3 >=2.0
   - pyyaml >=6.0
+  - openpyxl >=3.1
   - plotly >=5.18
   - streamlit >=1.38
   - bitarray >=2.0

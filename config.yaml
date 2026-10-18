@@ -26,15 +26,11 @@ meth_types:
   - "RNA_m6A"
 
 # GWAS Traits & Summary Statistics Mapping
-traits:
-  - "BipolarDisorder2024"
-  - "SUD2023"
-  - "SuicideAttempt"
-
-gwas_sumstats:
-  BipolarDisorder2024: "data/raw_data/BipolarDisorder2024_gwas.txt"
-  SUD2023: "data/raw_data/SUD2023_gwas.txt"
-  SuicideAttempt: "data/raw_data/SuicideAttempt_gwas.txt"
+# By default, Snakefile automatically discovers all GWAS files in data/raw_data/
+# (e.g., *_gwas.txt, *_gwas.tsv, *.txt.gz). You can optionally list additional
+# traits or custom file paths below if stored outside the standard naming pattern.
+traits: []
+gwas_sumstats: {}
 
 # DNA ASM Mapping & CpG-to-TSS Distance Parameters
 methylation:
