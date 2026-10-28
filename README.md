@@ -1,127 +1,140 @@
 # Complete-GWAS-Downstream-Analysis
 
-An automated, scalable pipeline integrating psychiatric and behavioral Genome-Wide Association Study (GWAS) summary statistics with LDSC genetic correlations and dual-modality functional epigenetic variant panels (**DNA Allele-Specific Methylation [DNA ASM]** and **RNA $m^6\text{A}$ methylation**).
+An automated Snakemake pipeline that overlaps psychiatric and behavioral GWAS summary statistics with two functional methylation variant panels, **DNA allele-specific methylation (DNA ASM)** and **RNA m6A methylation**, and identifies cross-trait pleiotropic loci. A Streamlit app (`app.py`) configures and launches runs (locally or on Slurm) and explores the results.
 
-The workflow identifies cross-phenotype pleiotropic hub variants, calculates candidate-space False Discovery Rate (FDR) adjustments using Storey's $q$-value or Benjamini-Hochberg (`fdr_bh`) procedures, performs proximal TSS ($\le 5\text{ kb}$) and Ensembl VEP / GTEx v10 cis-eQTL concordance analysis across 13 human brain tissues, and provides both publication-grade figures and an interactive Streamlit explorer.
+Multiple testing is controlled with **Benjamini-Hochberg FDR at 5%**, applied per trait. DNA ASM: one test per tag SNP (a tag absent from the GWAS is tested via its highest-LD proxy, `dna.tag_fallback`), and every LD proxy of a significant tag is retained, even if absent from the GWAS. RNA m6A: across the reference SNPs found in that trait's GWAS.
 
 ---
 
 ## Workflow Overview
 
 ```text
-Raw GWAS Summary Statistics (data/raw_data/*_gwas.txt)
+GWAS summary statistics (data/raw_data/*_gwas.txt)
   │
-  ├──► [Step 1–4: LDSC Genetic Correlation Branch]
-  │      munge_sumstats ──► ldsc_h2 / ldsc_rg ──► plot_heatmap.py & plot_genetic_correlations.py
-  │      Outputs: results/figures/rg_heatmap.pdf, results/figures/rg_network.pdf
+  ├──► Track A: DNA Methylation (DNA ASM tag SNPs & LD proxies with CpG annotations)
+  │      A1 overlap_dna_asm.py         Tag SNPs x GWAS + BH FDR 5%, then expand significant tags to LD proxies
+  │      A2 map_cpg_tss.py             CpG -> genes with TSS within 5 kb (hg19, GENCODE v19)
+  │      A3 lookup_gtex_brain_eqtls.py GTEx v10 eQTL target genes, 13 brain regions (significant SNPs only)
+  │      A4 compare_tss_gtex.py        Concordance: CpG-proximal gene == GTEx brain eQTL gene
+  │      A5 pleiotropy.py --mode dna   results/dna/pleiotropy_dna.tsv
   │
-  ├──► [Step 5a–5e: DNA ASM CpG-to-TSS (<5 kb) & GTEx Brain eQTL Branch]
-  │      overlap_dna_asm.py ──► map_cpg_tss.py ──► lookup_gtex_brain_eqtls.py ──► compare_tss_gtex.py
-  │      ──► interactive_cross_trait_asm.py
-  │      Outputs: results/methylation/dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv
-  │               results/methylation/dna_asm_{trait}_concordant_genes_summary.tsv
-  │               results/methylation/comparisons/cross_trait_asm_recurrent_snps.tsv
+  ├──► Track B: RNA Methylation (RNA m6A SNP list)
+  │      B1 overlap_rna_m6a.py         Overlap reference SNPs with GWAS + BH FDR 5%
+  │      B2 annotate_rna_genes.py      Ensembl GRCh37 genes each significant SNP falls inside (VEP REST)
+  │      B3 pleiotropy.py --mode rna   results/rna/pleiotropy_rna.tsv
   │
-  └──► [Step 5 / 5f: RNA m6A Host/VEP & GTEx Brain eQTL Branch]
-         overlap_methylation.py ──► compare_overlap_snps.py ──► annotate_snps_genes.py
-         ──► plot_pleiotropy_heatmap.py
-         Outputs: results/methylation/comparisons/cross_trait_rna_m6a_recurrent_snps*.tsv
-                  results/figures/cross_trait_rna_m6a_recurrent_snps_annotated_effect_heatmap.pdf
+  ├──► Munging (target `munge`, independent of both tracks)
+  │      ../ldsc/munge_sumstats.py     results/munged/{trait}.sumstats.gz (+ LDSC .log)
+  │
+  └──► Genetic correlation (target `rg`, from munged sumstats)
+         ../ldsc/ldsc.py --rg          results/ldsc_rg/{trait1}__{trait2}.log (one job per pair)
+         ldsc_rg_summary.py            results/ldsc_rg/rg_summary.tsv (rg, SE, Z, P, BH FDR across the run's pairs)
 ```
 
-## Key Features
+A SNP is *present* in a trait when it is BH-significant in that trait. The pleiotropy tables keep every SNP significant in at least one trait; the trait-sharing threshold is applied interactively in the app.
 
-- **Memory-Inverted O(1) Variant Extraction:** Streams multi-gigabyte GWAS summary statistics against in-memory candidate sets (`scripts/common_utils.py`), preventing out-of-memory errors on HPC clusters.
-- **Vectorized Binary-Search TSS Interval Mapping:** Uses `np.searchsorted` interval bounds ($[\text{CPG\_POS} - 5000, \text{CPG\_POS} + 5000]$) in `scripts/map_cpg_tss.py` to map CpGs to GENCODE v19 TSS positions without Cartesian memory blowups.
-- **Dual FDR Framework:** Supports both Benjamini-Hochberg FDR (`fdr_bh`) and Storey’s $q$-value ($\pi_0$-adjusted empirical FDR).
-- **Automated Brain Tissue Annotation & Caching:** Queries Ensembl VEP and GTEx v10 cis-eQTLs across 13 human brain regions with persistent, atomic JSON caching (`results/methylation/.gtex_eqtl_cache.json` and `results/methylation/.api_cache.json`).
-- **Two-Tier Architecture:** Unattended Slurm batch execution via Snakemake 9 (`profiles/slurm`) paired with on-demand interactive CLI and Streamlit exploration (`dashboard/app.py`).
+| Output | Columns |
+|---|---|
+| `results/dna/pleiotropy_dna.tsv` | `SNP, N_TRAITS, TRAITS_PRESENT, CONCORDANT, CONCORDANT_GENES, CPG_GENES_5KB, GTEX_BRAIN_GENES, CPG_IDS, GTEX_TISSUES, MIN_FDR_BH` |
+| `results/rna/pleiotropy_rna.tsv` | `SNP, GENES, N_TRAITS, TRAITS_PRESENT, MIN_FDR_BH` (`GENES`: overlapping Ensembl genes, or `intergenic` / `not in Ensembl` / `no primary-assembly locus`) |
+| `results/rna/rna_sig_genes.tsv` | One row per BH-significant RNA m6A SNP: `SNP, GENES, ENSEMBL_GENE_IDS, STATUS, CHR, POS` (GRCh37), `CONSEQUENCES, TRANSCRIPT_BIOTYPES, ENSEMBL_RELEASE` |
+| `results/dna/{trait}_overlap_all.tsv` | Every mapping row (tag + LD proxies) of each tested tag with the tag-level `GWAS_P, GWAS_BETA, GWAS_FDR_BH, BH_SIGNIFICANT, TESTED_SNP` and row-level `LD_R2, QUERY_IN_GWAS, QUERY_GWAS_P, QUERY_GWAS_BETA` |
+| `results/rna/{trait}_overlap_bh.tsv` | Every overlapping RNA m6A SNP with the same BH columns |
+| `results/ldsc_rg/rg_summary.tsv` | `Trait 1, Trait 2, rg, SE, Z, P-value, FDR`, h2 per trait, `gcov_int`, `Note` (why rg is NA) |
 
 ---
 
 ## Directory Structure
 
+All paths are relative to the repository root, so the folder can be moved between a workstation and the HPC unchanged.
+
 ```text
-Complete-GWAS-Downstream-Analysis/
-├── .gitignore
-├── AGENTS.md                           # Architecture & operating rules
-├── DATA_SCHEMA.md                      # Exact file & column schemas
-├── README.md
-├── Snakefile                           # Master Snakemake 9 workflow
-├── config.yaml                         # HPC & pipeline configuration
-├── envs/
-│   └── snakemake9.yaml                 # Conda environment specification
-├── profiles/
-│   └── slurm/config.yaml               # Snakemake 9 Slurm executor profile
+├── app.py                         # Streamlit front-end: run configuration, live progress, result explorer
+├── Snakefile                      # Workflow: targets all / dna / rna
+├── config.yaml                    # Pipeline configuration (HPC defaults)
+├── config_local.yaml              # Optional, git-ignored local overrides (e.g. reduced trait subset)
+├── envs/snakemake9.yaml           # Conda environment (pipeline + app)
+├── profiles/slurm/config.yaml     # Snakemake 9 Slurm executor profile (partition irbio01)
+├── patches/ldsc_python3.patch     # Python 3 fixes for the sibling ../ldsc repository (CBIIT/ldsc 6c67395)
 ├── scripts/
-│   ├── common_utils.py                 # Consolidated utilities (chr norm, GWAS I/O, FDR, GTEx/VEP cache, LDSC parser)
-│   ├── overlap_methylation.py          # Step 5: Stream GWAS overlap for DNA_ASM & RNA_m6A SNP lists
-│   ├── overlap_dna_asm.py              # Step 5a: Intersect GWAS with DNA ASM Tag & LD proxy table
-│   ├── map_cpg_tss.py                  # Step 5b: Binary-search interval mapping of CpGs to GENCODE v19 TSS (<=5 kb)
-│   ├── lookup_gtex_brain_eqtls.py      # Step 5c: Batched GTEx v10 brain eQTL lookup with persistent cache
-│   ├── compare_tss_gtex.py             # Step 5d: Classify CpG nearest-TSS vs. GTEx eQTL gene concordance
-│   ├── interactive_cross_trait_asm.py  # Step 5e: Cross-trait DNA ASM FDR & recurrence matrix builder
-│   ├── run_interactive_pipeline.py     # Step 5f / Interactive unified runner (RNA_m6A, DNA_ASM, or both)
-│   ├── compare_overlap_snps.py         # Multi-trait RNA m6A / overlap FDR & direction concordance filter
-│   ├── annotate_snps_genes.py          # Ensembl VEP & GTEx v10 eQTL annotator for overlap tables
-│   ├── plot_pleiotropy_heatmap.py      # Publication-grade cross-trait pleiotropy heatmap
-│   ├── plot_heatmap.py                 # LDSC pairwise genetic correlation matrix heatmap
-│   ├── plot_genetic_correlations.py    # LDSC circular genetic correlation network (FDR < 0.05)
-│   ├── ldsnps_filtering.py             # Standalone preprocessing utility: Excel -> DNA_ASM_mapping_table.tsv
-│   └── tss_fetching.py                 # Standalone preprocessing utility: GENCODE GTF -> gencode_v19_gene_tss.tsv
-├── dashboard/
-│   ├── app.py                          # Two-tab Streamlit Explorer (RNA m6A & DNA ASM)
-│   └── requirements.txt                # Dashboard dependencies
+│   ├── common_utils.py            # GWAS discovery & streaming, BH FDR, HTTP/cache helpers
+│   ├── overlap_dna_asm.py         # A1
+│   ├── map_cpg_tss.py             # A2
+│   ├── lookup_gtex_brain_eqtls.py # A3
+│   ├── compare_tss_gtex.py        # A4
+│   ├── overlap_rna_m6a.py         # B1
+│   ├── annotate_rna_genes.py      # B2
+│   ├── pleiotropy.py              # A5 / B3
+│   ├── ldsc_rg_summary.py         # LDSC --rg log parser, pair selection, BH FDR across pairs
+│   ├── run_pipeline.py            # Launcher used by app.py and run_pipeline.sbatch
+│   ├── run_pipeline.sbatch        # Slurm controller job
+│   ├── ldsnps_filtering.py        # Reference builder: Excel -> DNA_ASM_mapping_table.tsv
+│   └── tss_fetching.py            # Reference builder: GENCODE GTF -> gencode_v19_gene_tss.tsv
 ├── data/
-│   ├── annotations/                    # Tracked: cpg_coordinates_hg19.tsv, gencode_v19_gene_tss.tsv
-│   ├── methylation/                    # Tracked: DNA_ASM_mapping_table.tsv, DNA_ASM_SNPlist.txt, RNA_m6A_SNPlist.txt
-│   ├── raw_data/                       # Ignored: Raw GWAS summary statistics (*_gwas.txt)
-│   └── reference/                      # Ignored: HapMap3 snplist & LDscores
-└── results/                            # Ignored: Generated munged sumstats, LDSC logs, methylation tables & figures
+│   ├── annotations/               # cpg_coordinates_hg19.tsv, gencode_v19_gene_tss.tsv
+│   ├── methylation/               # DNA_ASM_mapping_table.tsv, RNA_m6A_SNPlist.txt
+│   └── raw_data/                  # GWAS summary statistics (git-ignored)
+├── results/                       # dna/, rna/, munged/, ldsc_rg/ (+ stdout/ live logs), .cache/ (git-ignored)
+└── logs/                          # runs/ (app & controller logs), munge/ (live munge output), slurm/ (git-ignored)
+../ldsc/                           # Sibling LDSC repository providing munge_sumstats.py and ldsc.py
 ```
 
 ---
 
-## Installation & Computational Environments
+## Installation
 
-1. **Snakemake 9 Batch Pipeline (HPC or Local):**
 ```bash
 conda env create -f envs/snakemake9.yaml
 conda activate snakemake9_env
 ```
 
-2. **Interactive Dashboard (Local PC or Interactive Node):**
-```bash
-pip install -r dashboard/requirements.txt
-```
-
 ---
 
-## Pipeline Execution
+## Usage
 
-### Tier 1: Automated Batch Pipeline (Snakemake 9)
+### Streamlit app (local or HPC login node)
+```bash
+streamlit run app.py
+```
+**Methylation tabs:** select traits, target mode (Both / DNA only / RNA only) and execution engine (Local or HPC; HPC is preselected when `sbatch` is available), then press **Run pipeline**. The run continues in the background; the app shows live progress and the log, and refreshes the result tables when it finishes. The RNA tab lists each SNP's overlapping Ensembl gene(s) and can be searched by rsID or gene. On the HPC, open the app through SSH port forwarding, e.g. `ssh -L 8502:localhost:8502 user@cluster`.
+
+**🧹 Munge Sumstats tab:** select unmunged traits (or tick *Include already munged traits* to re-munge), check the reference alleles file and the per-trait sample size (manual N > N column override > detected N column; the resolved LDSC flags are shown), then press **Run Munging**. Each trait shows Queued / Running / Done with a live log viewer, and the inventory lists `results/munged/` with size, date, SNPs with Z, mean χ² and λGC, plus file previews.
+
+**📊 Genetic Correlation tab:** check the munged-sumstats QC table (SNPs retained, mean χ², λGC), choose **All-vs-All Matrix** (N ≥ 2 traits, N(N−1)/2 pairs) or **Target vs. Panel** (one target, K panel traits), then press **Run Genetic Correlation**. Already computed pairs are reused (tick *Re-run* to recompute). A status panel shows per-pair progress and a live LDSC log. Results show a symmetric rg heatmap (matrix) or a forest plot with 95% CI (target vs. panel), plus a table with BH FDR computed across the pairs on screen (`*` = FDR < 5%) and a TSV export.
+
+### Command line
 ```bash
 # Dry-run DAG validation
 snakemake -n all
 
-# Full batch pipeline on Slurm HPC (Munge + LDSC + Figures + DNA ASM + RNA m6A)
+# Local run (traits from config / config_local.yaml, or explicit)
+snakemake --cores 2 all
+snakemake --cores 2 dna --config traits=SUD2023,BipolarDisorder2024
+
+# LDSC munging (all traits, or a subset; manual N per trait lives in config.yaml ldsc.n_override)
+snakemake --cores 2 munge
+snakemake --cores 2 munge --config "traits=SUD2023" --forcerun munge_sumstats
+
+# Genetic correlation: all pairs of rg.traits, or rg.target vs each of rg.traits
+snakemake --cores 2 rg --config traits=A,B,C 'rg={"traits": ["A", "B", "C"], "target": ""}'
+snakemake --cores 2 rg --config traits=A,B,C 'rg={"traits": ["B", "C"], "target": "A"}'
+
+# Slurm, directly from the login node
 snakemake --profile profiles/slurm all
 
-# Methylation branch only (DNA ASM + RNA m6A)
-snakemake --profile profiles/slurm --jobs 10 methylation
-
-# Local multi-core execution
-snakemake --cores 2 all
+# Slurm, as a controller job that survives logout
+mkdir -p logs/runs
+sbatch scripts/run_pipeline.sbatch all SUD2023,BipolarDisorder2024
 ```
 
-### Tier 2: Interactive Post-Processing & Exploration
+### LDSC requirements
+Munging runs `../ldsc/munge_sumstats.py` with the `snakemake9_env` interpreter (validated with pandas 3: Z, alleles and N match the raw sumstats). The sibling LDSC copy must contain the Python 3 fixes; if the app warns that it is unpatched (e.g. a fresh clone on the HPC):
 ```bash
-# Option A: Launch the two-tab Streamlit Dashboard (RNA m6A + DNA ASM)
-streamlit run dashboard/app.py
-
-# Option B: Unified interactive CLI runner (choose RNA_m6A, DNA_ASM, or both)
-python scripts/run_interactive_pipeline.py -i
-
-# Option C: Standalone DNA ASM cross-trait interactive explorer
-python scripts/interactive_cross_trait_asm.py -i
+git -C ../ldsc checkout 6c67395      # CBIIT/ldsc base commit the patch applies to
+git -C ../ldsc apply --check patches/ldsc_python3.patch && git -C ../ldsc apply patches/ldsc_python3.patch
 ```
+
+### Notes
+- Step A3 queries the GTEx Portal API and needs outbound internet access on the node that runs it. Results are cached in `results/.cache/gtex_eqtl_cache.json`; failed requests are not cached and make the job fail so it can be retried.
+- Step B2 queries the Ensembl VEP REST API (`rna.ensembl_server`, GRCh37 by default to match Track A's hg19 coordinates) and also needs internet access. A gene is reported when the SNP falls inside one of its transcripts (any biotype); genes VEP reports only as up/downstream (≤ 5 kb) are excluded. Results are cached in `results/.cache/ensembl_grch37_genes_cache.json`; failed requests are not cached and make the job fail. Use a different cache file if you switch server/assembly.
+- `config_local.yaml` overrides `config.yaml` whenever it is present; do not copy it to the HPC unless you want its trait subset there.

@@ -9,10 +9,10 @@ import gzip
 import os
 import re
 
-from common_utils import is_gzipped
+from common_utils import PROJECT_ROOT, is_gzipped
 
-GTF_INPUT = "data/annotations/gencode.v19.annotation.gtf_withproteinids"
-TSV_OUTPUT = "data/annotations/gencode_v19_gene_tss.tsv"
+GTF_INPUT = str(PROJECT_ROOT / "data" / "annotations" / "gencode.v19.annotation.gtf_withproteinids")
+TSV_OUTPUT = str(PROJECT_ROOT / "data" / "annotations" / "gencode_v19_gene_tss.tsv")
 
 RE_GENE_NAME = re.compile(r'gene_name "([^"]+)"')
 RE_GENE_TYPE = re.compile(r'(?:gene_type|gene_biotype) "([^"]+)"')

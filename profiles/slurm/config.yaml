@@ -1,73 +1,44 @@
 # ==============================================================================
 # Snakemake 9 Slurm Profile for VIBRA HPC
 #
-# Usage:
+# Usage (from the repository root, with snakemake9_env activated):
 #   snakemake --profile profiles/slurm all
-#   snakemake --profile profiles/slurm methylation
+#   snakemake --profile profiles/slurm dna
+#   snakemake --profile profiles/slurm rna
+#
+# Jobs are submitted with --export=ALL, so they inherit the activated conda env.
+# Per-job Slurm logs are written to logs/slurm/{rule}/{wildcards}/{jobid}.log
+# (the executor plugin manages --output/--error itself; do not set them in slurm_extra).
 # ==============================================================================
 
 executor: slurm
-jobs: 5
+jobs: 10
 latency-wait: 60
 printshellcmds: true
+slurm-logdir: "logs/slurm"
+slurm-keep-successful-logs: true
 
 default-resources:
   slurm_partition: "irbio01"
-  runtime: 60
+  runtime: 30
   mem_mb: 4000
-  slurm_extra: "'--output=logs/%x_%j.out --error=logs/%x_%j.err'"
 
 set-resources:
   munge_sumstats:
     runtime: 360
     mem_mb: 16000
-    slurm_partition: "irbio01"
-  ldsc_h2:
-    runtime: 60
-    mem_mb: 16000
-    slurm_partition: "irbio01"
-  ldsc_rg:
-    runtime: 120
-    mem_mb: 16000
-    slurm_partition: "irbio01"
-  plot_heatmap:
-    runtime: 30
-    mem_mb: 4000
-    slurm_partition: "irbio01"
-  plot_network:
-    runtime: 30
-    mem_mb: 4000
-    slurm_partition: "irbio01"
-  methylation_overlap:
-    runtime: 15
-    mem_mb: 4000
-    slurm_partition: "irbio01"
   overlap_dna_asm:
-    runtime: 30
+    runtime: 60
     mem_mb: 8000
-    slurm_partition: "irbio01"
-  map_cpg_to_tss_genes:
-    runtime: 15
-    mem_mb: 4000
-    slurm_partition: "irbio01"
+  overlap_rna_m6a:
+    runtime: 60
+    mem_mb: 8000
   lookup_gtex_brain_eqtls:
-    runtime: 30
+    runtime: 120
     mem_mb: 4000
-    slurm_partition: "irbio01"
-  compare_tss_and_gtex_genes:
-    runtime: 15
+  annotate_rna_genes:
+    runtime: 120
     mem_mb: 4000
-    slurm_partition: "irbio01"
-  cross_trait_asm_summary:
-    runtime: 15
-    mem_mb: 4000
-    slurm_partition: "irbio01"
-  cross_trait_rna_m6a_summary:
-    runtime: 30
-    mem_mb: 4000
-    slurm_partition: "irbio01"
-
-
-
-
-
+  ldsc_rg:
+    runtime: 60
+    mem_mb: 8000

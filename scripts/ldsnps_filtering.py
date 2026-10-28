@@ -1,10 +1,15 @@
 """Process DNA_ASM_Tag_LD_snps.xlsx into the long-format DNA_ASM_mapping_table.tsv reference.
 
+Columns: CPG_ID, TAG_SNP, QUERY_SNP, RELATIONSHIP, LD_R2 (workbook "LD": QUERY_SNP-TAG_SNP r2; 1.0 for tags).
+
 Retained as a standalone reference preprocessing utility.
 """
 
 import argparse
+
 import pandas as pd
+
+from common_utils import PROJECT_ROOT
 
 
 def build_dna_asm_mapping(excel_file: str, output_tsv: str, nrows: int = None) -> pd.DataFrame:
@@ -12,13 +17,13 @@ def build_dna_asm_mapping(excel_file: str, output_tsv: str, nrows: int = None) -
     df = pd.read_excel(
         excel_file,
         sheet_name="All",
-        usecols=["IlmnID.1", "SNP.1", "SNPstagged", "tagSNP"],
+        usecols=["IlmnID.1", "SNP.1", "SNPstagged", "tagSNP", "LD"],
         nrows=nrows,
     )
 
     records = []
     for row in df.itertuples(index=False):
-        cpg_raw, snp_y_raw, tagged_raw, tag_snp_raw = row
+        cpg_raw, snp_y_raw, tagged_raw, tag_snp_raw, ld_raw = row
         cpg = str(cpg_raw).strip() if pd.notna(cpg_raw) else None
         snp_y = str(snp_y_raw).strip() if pd.notna(snp_y_raw) else None
         tagged = str(tagged_raw).strip() if pd.notna(tagged_raw) else None
@@ -34,6 +39,7 @@ def build_dna_asm_mapping(excel_file: str, output_tsv: str, nrows: int = None) -
                     "TAG_SNP": snp_y,
                     "QUERY_SNP": snp_y,
                     "RELATIONSHIP": "TAG",
+                    "LD_R2": 1.0,
                 })
             continue
 
@@ -45,6 +51,7 @@ def build_dna_asm_mapping(excel_file: str, output_tsv: str, nrows: int = None) -
                 "TAG_SNP": assigned_tag,
                 "QUERY_SNP": tagged,
                 "RELATIONSHIP": rel,
+                "LD_R2": 1.0 if rel == "TAG" else ld_raw,
             })
 
     result_df = pd.DataFrame(records)
@@ -62,7 +69,7 @@ def build_dna_asm_mapping(excel_file: str, output_tsv: str, nrows: int = None) -
         result_df[["CPG_ID", "TAG_SNP"]].drop_duplicates().itertuples(index=False, name=None)
     )
     self_tags = [
-        {"CPG_ID": cpg, "TAG_SNP": tag, "QUERY_SNP": tag, "RELATIONSHIP": "TAG"}
+        {"CPG_ID": cpg, "TAG_SNP": tag, "QUERY_SNP": tag, "RELATIONSHIP": "TAG", "LD_R2": 1.0}
         for cpg, tag in all_pairs
         if (cpg, tag) not in pairs_with_self
     ]
@@ -83,11 +90,13 @@ if __name__ == "__main__":
         description="Build DNA_ASM_mapping_table.tsv from DNA_ASM_Tag_LD_snps.xlsx."
     )
     parser.add_argument(
-        "--input", default="DNA_ASM_Tag_LD_snps.xlsx", help="Path to source Excel file."
+        "--input",
+        default=str(PROJECT_ROOT / "DNA_ASM_Tag_LD_snps.xlsx"),
+        help="Path to source Excel file.",
     )
     parser.add_argument(
         "--output",
-        default="data/methylation/DNA_ASM_mapping_table.tsv",
+        default=str(PROJECT_ROOT / "data" / "methylation" / "DNA_ASM_mapping_table.tsv"),
         help="Output TSV path.",
     )
     parser.add_argument("--nrows", type=int, default=None, help="Optional row limit for testing.")

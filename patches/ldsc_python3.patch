@@ -1,0 +1,147 @@
+diff --git a/ldscore/parse.py b/ldscore/parse.py
+index 78b6e0c..ee808fe 100644
+--- a/ldscore/parse.py
++++ b/ldscore/parse.py
+@@ -19,30 +19,12 @@ def series_eq(x, y):
+ 
+ def read_csv(fh, **kwargs):
+     '''Read CSV file with optional compression handling.'''
+-    #print(fh)
+     if fh.endswith('.gz'):
+-        try:
+-            f = gzip.open(fh, 'rt')
+-            #print(f)
+-           
+-            try:
+-                with warnings.catch_warnings(record=True) as w:
+-                    warnings.simplefilter("always")
+-                    df = pd.read_csv(f, sep=r'\s+', na_values='.', **kwargs)
+-                    if any("compression has no effect" in str(warning.message) for warning in w):
+-                        print(f"RuntimeWarning: compression has no effect when passing a non-binary object as input for file {fh}")
+-                        #return (f"An error occurred while reading the file {fh} with pandas: {e}")
+-                #print(f"DataFrame shape: {df.shape}")  # Print the shape of the DataFrame
+-                return df
+-         
+-            except Exception as e:
+-                print(f"An error occurred while reading the file {fh} with pandas: {e}")
+-                return (f"An error occurred while reading the file {fh} with pandas: {e}")
+-        except Exception as e:
+-            print(f"An error occurred while reading the file {fh}: {e}")
+-            return None
++        kwargs.pop('compression', None)
++        with gzip.open(fh, 'rt') as f:
++            return pd.read_csv(f, sep=r'\s+', na_values='.', **kwargs)
+     else:
+-        return pd.read_csv(fh,  sep='\s+', na_values='.', **kwargs)
++        return pd.read_csv(fh, sep=r'\s+', na_values='.', **kwargs)
+ 
+ def sub_chr(s, chrom):
+     '''Substitute chr for @, else append chr to the end of str.'''
+diff --git a/ldscore/regressions.py b/ldscore/regressions.py
+index 96defde..4e26843 100644
+--- a/ldscore/regressions.py
++++ b/ldscore/regressions.py
+@@ -520,11 +520,11 @@ class Hsq(LD_Score_Regression):
+             Regression weights. Approx equal to reciprocal of conditional variance function.
+ 
+         '''
+-        M = float(M)
++        M = float(np.asarray(M).item())
+         if intercept is None:
+             intercept = 1
+ 
+-        hsq = max(hsq, 0.0)
++        hsq = max(float(np.asarray(hsq).item()), 0.0)
+         hsq = min(hsq, 1.0)
+         ld = np.fmax(ld, 1.0)
+         w_ld = np.fmax(w_ld, 1.0)
+@@ -649,7 +649,7 @@ class Gencov(LD_Score_Regression):
+             Regression weights. Approx equal to reciprocal of conditional variance function.
+ 
+         '''
+-        M = float(M)
++        M = float(np.asarray(M).item())
+         if intercept_gencov is None:
+             intercept_gencov = 0
+         if intercept_hsq1 is None:
+@@ -657,9 +657,9 @@ class Gencov(LD_Score_Regression):
+         if intercept_hsq2 is None:
+             intercept_hsq2 = 1
+ 
+-        h1, h2 = max(h1, 0.0), max(h2, 0.0)
++        h1, h2 = max(float(np.asarray(h1).item()), 0.0), max(float(np.asarray(h2).item()), 0.0)
+         h1, h2 = min(h1, 1.0), min(h2, 1.0)
+-        rho_g = min(rho_g, 1.0)
++        rho_g = min(float(np.asarray(rho_g).item()), 1.0)
+         rho_g = max(rho_g, -1.0)
+         ld = np.fmax(ld, 1.0)
+         w_ld = np.fmax(w_ld, 1.0)
+@@ -707,9 +707,9 @@ class RG(object):
+             
+             rg = jk.RatioJackknife(
+                 rg_ratio, gencov.tot_delete_values, denom_delete_values)
+-            self.rg_jknife = float(rg.jknife_est)
+-            self.rg_se = float(rg.jknife_se)
+-            self.rg_ratio = float(rg_ratio)
++            self.rg_jknife = float(np.asarray(rg.jknife_est).item())
++            self.rg_se = float(np.asarray(rg.jknife_se).item())
++            self.rg_ratio = float(np.asarray(rg_ratio).item())
+             self.p, self.z = p_z_norm(self.rg_ratio, self.rg_se)
+ 
+     def summary(self, silly=False):
+diff --git a/ldscore/sumstats.py b/ldscore/sumstats.py
+index 5bd6a1c..33d7ff9 100644
+--- a/ldscore/sumstats.py
++++ b/ldscore/sumstats.py
+@@ -62,7 +62,7 @@ def smart_merge(x, y):
+     '''Check if SNP columns are equal. If so, save time by using concat instead of merge.'''
+     if len(x) == len(y) and (x.index == y.index).all() and (x.SNP == y.SNP).all():
+         x = x.reset_index(drop=True)
+-        y = y.reset_index(drop=True).drop('SNP', 1)
++        y = y.reset_index(drop=True).drop('SNP', axis=1)
+         out = pd.concat([x, y], axis=1)
+     else:
+         out = pd.merge(x, y, how='inner', on='SNP')
+@@ -415,12 +415,14 @@ def estimate_rg(args, log):
+             msg = 'ERROR computing rg for phenotype {I}/{N}, from file {F}.'
+             log.log(msg.format(I=i + 2, N=len(rg_paths), F=rg_paths[i + 1]))
+             ex_type, ex, tb = sys.exc_info()
+-            log.log(traceback.format_exc(ex) + '\n')
++            log.log(traceback.format_exc() + '\n')
+             if len(RG) <= i:  # if exception raised before appending to RG
+                 RG.append(None)
+ 
+     log.log('\nSummary of Genetic Correlation Results\n' +
+             _get_rg_table(rg_paths, RG, args))
++    if all(r is None for r in RG):
++        raise RuntimeError('LDSC genetic correlation calculation failed.')
+     return RG
+ 
+ 
+diff --git a/munge_sumstats.py b/munge_sumstats.py
+index 3605dec..bbe4ef7 100755
+--- a/munge_sumstats.py
++++ b/munge_sumstats.py
+@@ -228,10 +228,10 @@ def parse_dat(dat_gen, convert_colname, merge_alleles, log, args):
+         sys.stdout.write('.')
+         tot_snps += len(dat)
+         old = len(dat)
+-        dat = dat.dropna(axis=0, how="any", subset=filter(
+-            lambda x: x != 'INFO', dat.columns)).reset_index(drop=True)
++        dat = dat.dropna(axis=0, how="any", subset=list(filter(
++            lambda x: x != 'INFO', dat.columns))).reset_index(drop=True)
+         drops['NA'] += old - len(dat)
+-        dat.columns = map(lambda x: convert_colname[x], dat.columns)
++        dat.columns = list(map(lambda x: convert_colname[x], dat.columns))
+ 
+         wrong_types = [c for c in dat.columns if c in numeric_cols and not np.issubdtype(dat[c].dtype, np.number)]
+         if len(wrong_types) > 0:
+@@ -662,7 +662,7 @@ def munge_sumstats(args, p=True):
+             # they're read as floats
+             signed_sumstat_cols = [k for k,v in cname_translation.items() if v=='SIGNED_SUMSTAT']
+             dat_gen = pd.read_csv(args.sumstats, sep=r'\s+', header=0,
+-                    compression=compression, usecols=cname_translation.keys(),
++                    compression=compression, usecols=list(cname_translation.keys()),
+                     na_values=['.', 'NA'], iterator=True, chunksize=args.chunksize,
+                     dtype={c:np.float64 for c in signed_sumstat_cols})
+ 

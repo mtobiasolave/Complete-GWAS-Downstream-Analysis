@@ -1,28 +1,28 @@
-"""Shared utility functions and constants for the GWAS, LDSC & Methylation pipeline.
+"""Shared utility functions and constants for the DNA & RNA Methylation x GWAS pipeline.
 
 Consolidates repetitive operations across pipeline scripts:
+- Project-root path resolution and GWAS summary statistics discovery
 - Chromosome string normalization ('chr1' vs '1')
 - GWAS header detection and streaming O(1)-memory SNP filtering
-- Multiple-testing corrections (Benjamini-Hochberg FDR and Storey's q-value)
-- Gene symbol set parsing and concordance helpers
+- Benjamini-Hochberg (BH) FDR correction of candidate-space GWAS overlaps
+- Gene symbol set formatting helpers
 - Resilient HTTP session creation and atomic JSON cache I/O
-- LDSC genetic correlation log parsing
+- LDSC munge_sumstats.py column-flag mapping (SNP, alleles, P, sample size)
 """
 
 import gzip
+import io
 import json
 import os
 import re
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
-try:
-    from statsmodels.stats.multitest import multipletests
-    HAS_STATSMODELS = True
-except ImportError:
-    HAS_STATSMODELS = False
+# Repository root (scripts/ lives one level below it); all default paths resolve from here
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 # =====================================================================
@@ -32,13 +32,8 @@ except ImportError:
 HEADER_ALIASES: Dict[str, List[str]] = {
     "SNP": ["RSID", "SNP", "SNPID", "MARKERNAME", "ID", "RS_NUMBER", "VARIANT_ID"],
     "P": ["P", "PVAL", "P_VALUE", "PVALUE", "P.VALUE", "P-VALUE", "P-VAL", "P_BOLT_LMM", "P_WALD"],
-    "EFFECT": ["BETA", "OR", "B", "Z", "EFFECT", "EFF", "LOG_ODDS", "LOGOR", "ESTIMATE", "ZSCORE"],
     "BETA": ["BETA", "B", "EFFECT", "EFF", "ESTIMATE", "LOGOR", "LOG_ODDS"],
     "OR": ["OR", "ODDS_RATIO", "ODDS-RATIO", "ODDSRATIO"],
-    "CHR": ["CHR", "CHROM", "#CHROM", "CHROMOSOME"],
-    "BP": ["BP", "POS", "POSITION", "BASE_PAIR_LOCATION"],
-    "A1": ["A1", "ALLELE1", "EFFECT_ALLELE", "ALT", "INC_ALLELE", "EA"],
-    "A2": ["A2", "ALLELE2", "OTHER_ALLELE", "REF", "DEC_ALLELE", "NEA", "OA"],
 }
 
 DEFAULT_BRAIN_TISSUES: List[str] = [
@@ -62,7 +57,19 @@ TISSUE_TYPO_FIXES: Dict[str, str] = {
     "Brain_Amydgala": "Brain_Amygdala",
 }
 
-INVALID_TOKENS: Set[str] = {"", "NA", "NAN", "NONE", "NULL", "."}
+INVALID_TOKENS: Set[str] = {"", "NA", "NAN", "NONE", "NULL", ".", "<NA>", "NONE_WITHIN_5KB"}
+
+# Recognized GWAS file suffixes, longest first so "_gwas.txt.gz" wins over ".txt.gz"
+GWAS_SUFFIXES: Tuple[str, ...] = (
+    "_gwas.txt.gz",
+    "_gwas.tsv.gz",
+    "_gwas.txt",
+    "_gwas.tsv",
+    ".txt.gz",
+    ".tsv.gz",
+    ".txt",
+    ".tsv",
+)
 
 
 def normalize_tissues(tissues_arg: Optional[Sequence[str]] = None) -> List[str]:
@@ -77,8 +84,26 @@ def normalize_tissues(tissues_arg: Optional[Sequence[str]] = None) -> List[str]:
 
 
 # =====================================================================
-# 2. File & String Normalization Helpers
+# 2. GWAS Discovery, File & String Normalization Helpers
 # =====================================================================
+
+def discover_gwas(raw_dir: Union[str, Path] = "data/raw_data") -> Dict[str, str]:
+    """Map each trait name to its GWAS file path (POSIX-style, as given) in `raw_dir`."""
+    raw_dir = Path(raw_dir)
+    discovered: Dict[str, str] = {}
+    if not raw_dir.is_dir():
+        return discovered
+    for fpath in sorted(raw_dir.iterdir()):
+        if fpath.name.startswith(".") or not fpath.is_file():
+            continue
+        for suf in GWAS_SUFFIXES:
+            if fpath.name.endswith(suf):
+                trait_name = fpath.name[: -len(suf)]
+                if trait_name:
+                    discovered[trait_name] = fpath.as_posix()
+                break
+    return discovered
+
 
 def is_gzipped(filepath: str) -> bool:
     """Check if a file is gzip-compressed by inspecting its first two magic bytes."""
@@ -122,18 +147,6 @@ def standardize_chr(chr_input: Union[pd.Series, str, int]) -> Union[pd.Series, s
     elif u in ("X", "Y", "M"):
         val = u
     return f"chr{val}"
-
-
-def clean_rsid(val: object) -> str:
-    """Normalize an rsID string (strip alleles like rs123:A:G -> rs123, lowercase)."""
-    if pd.isna(val):
-        return ""
-    s = str(val).strip()
-    if not s or s.upper() in INVALID_TOKENS:
-        return ""
-    if ":" in s:
-        s = s.split(":", 1)[0].strip()
-    return s.lower()
 
 
 # =====================================================================
@@ -203,8 +216,6 @@ def extract_matching_gwas_rows(
 
 def extract_matching_gwas_df(gwas_path: str, target_snps: Set[str]) -> pd.DataFrame:
     """Stream a raw GWAS file and return a DataFrame of rows matching `target_snps`."""
-    import io
-
     header_line, matched_lines, _ = extract_matching_gwas_rows(gwas_path, target_snps)
     if not matched_lines:
         return pd.DataFrame(columns=header_line.strip().split())
@@ -212,81 +223,102 @@ def extract_matching_gwas_df(gwas_path: str, target_snps: Set[str]) -> pd.DataFr
     return pd.read_csv(buffer, sep=r"\s+", engine="c", low_memory=False)
 
 
-
 # =====================================================================
-# 4. Multiple-Testing Correction (BH FDR & Storey's q-value)
+# 4. Benjamini-Hochberg FDR Correction of GWAS Overlaps
 # =====================================================================
 
-def _bh_fallback(p: np.ndarray) -> np.ndarray:
-    """Pure NumPy Benjamini-Hochberg step-up adjusted p-values."""
-    m = len(p)
-    if m == 0:
-        return np.array([], dtype=float)
-    order = np.argsort(p)
-    ranked_p = p[order]
-    ranks = np.arange(1, m + 1, dtype=float)
-    adj = ranked_p * m / ranks
-    adj = np.minimum.accumulate(adj[::-1])[::-1]
-    adj = np.clip(adj, 0.0, 1.0)
-    out = np.empty(m, dtype=float)
-    out[order] = adj
-    return out
+BH_COLUMNS: List[str] = ["SNP", "GWAS_P", "GWAS_BETA", "GWAS_FDR_BH", "BH_SIGNIFICANT"]
 
 
-def storey_qvalues(
-    pvals: Sequence[float], lambda_val: float = 0.5, return_pi0: bool = False
-) -> Union[np.ndarray, Tuple[np.ndarray, float]]:
-    """Compute Storey's (2002) q-values estimating pi0 at `lambda_val` (default 0.5).
+def bh_fdr(pvals: Sequence[float]) -> np.ndarray:
+    """Benjamini-Hochberg (1995) step-up adjusted p-values.
 
-    Preserves NaN positions and clips q-values to [0, 1].
+    Invalid entries (NaN or outside [0, 1]) are excluded from the testing family
+    and returned as NaN in their original positions.
     """
-    p = np.asarray(pvals, dtype=float)
-    q_out = np.full(p.shape, np.nan, dtype=float)
-    valid_mask = ~np.isnan(p) & (p >= 0.0) & (p <= 1.0)
-    p_valid = p[valid_mask]
-    m = len(p_valid)
-    if m == 0:
-        return (q_out, 1.0) if return_pi0 else q_out
-
-    pi0 = np.sum(p_valid > lambda_val) / (m * (1.0 - lambda_val))
-    pi0 = float(np.clip(pi0, 0.0, 1.0))
-    if pi0 <= 0.0:
-        pi0 = 1.0
-
-    sort_idx = np.argsort(p_valid)
-    p_sorted = p_valid[sort_idx]
-    ranks = np.arange(1, m + 1, dtype=float)
-
-    q_sorted = (pi0 * m * p_sorted) / ranks
-    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
-    q_sorted = np.clip(q_sorted, 0.0, 1.0)
-
-    q_valid = np.empty(m, dtype=float)
-    q_valid[sort_idx] = q_sorted
-    q_out[valid_mask] = q_valid
-    return (q_out, pi0) if return_pi0 else q_out
-
-
-def compute_fdr(pvals: Sequence[float], method: str = "bh") -> np.ndarray:
-    """Compute multiple-testing adjusted p-values ('bh'/'fdr_bh' or 'storey'/'qvalue')."""
-    method_norm = method.strip().lower()
-    if method_norm in ("storey", "qvalue"):
-        return storey_qvalues(pvals)
-
     p = np.asarray(pvals, dtype=float)
     out = np.full(p.shape, np.nan, dtype=float)
     valid_mask = ~np.isnan(p) & (p >= 0.0) & (p <= 1.0)
     p_valid = p[valid_mask]
-    if len(p_valid) == 0:
+    m = len(p_valid)
+    if m == 0:
         return out
 
-    if HAS_STATSMODELS:
-        _, p_adj, _, _ = multipletests(p_valid, alpha=0.05, method="fdr_bh")
-    else:
-        p_adj = _bh_fallback(p_valid)
-
-    out[valid_mask] = p_adj
+    order = np.argsort(p_valid, kind="mergesort")
+    adj = p_valid[order] * m / np.arange(1, m + 1, dtype=float)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    adj_valid = np.empty(m, dtype=float)
+    adj_valid[order] = np.clip(adj, 0.0, 1.0)
+    out[valid_mask] = adj_valid
     return out
+
+
+GWAS_LOOKUP_COLUMNS: List[str] = ["SNP", "GWAS_P", "GWAS_BETA"]
+
+
+def gwas_lookup(gwas_path: str, candidate_snps: Set[str]) -> pd.DataFrame:
+    """Extract a reference SNP set from one GWAS with harmonized P and effect size.
+
+    Duplicate GWAS rows keep the first occurrence. Effect sizes are harmonized to
+    BETA, converting OR to ln(OR) when no BETA column is present.
+
+    Returns a DataFrame with GWAS_LOOKUP_COLUMNS, one row per overlapping SNP.
+    """
+    df_raw = extract_matching_gwas_df(gwas_path, candidate_snps)
+
+    snp_col = detect_column(df_raw.columns, "SNP")
+    p_col = detect_column(df_raw.columns, "P")
+    beta_col = detect_column(df_raw.columns, "BETA")
+    or_col = detect_column(df_raw.columns, "OR")
+    if not snp_col or not p_col:
+        raise ValueError(
+            f"Could not detect SNP ({snp_col}) or P ({p_col}) column in {gwas_path}. "
+            f"Columns found: {list(df_raw.columns)}"
+        )
+
+    if beta_col:
+        beta_vals = pd.to_numeric(df_raw[beta_col], errors="coerce")
+    elif or_col:
+        or_vals = pd.to_numeric(df_raw[or_col], errors="coerce")
+        beta_vals = np.log(or_vals.where(or_vals > 0))
+    else:
+        beta_vals = pd.Series(np.nan, index=df_raw.index)
+
+    overlap = (
+        pd.DataFrame({
+            "SNP": df_raw[snp_col].astype(str).str.strip(),
+            "GWAS_P": pd.to_numeric(df_raw[p_col], errors="coerce"),
+            "GWAS_BETA": beta_vals,
+        })
+        .drop_duplicates(subset=["SNP"], keep="first")
+        .reset_index(drop=True)
+    )
+    print(
+        f"[gwas_lookup] {os.path.basename(gwas_path)}: {len(overlap):,} of {len(candidate_snps):,} "
+        f"candidate SNPs found (P col='{p_col}', effect col='{beta_col or or_col}', "
+        f"OR->ln(OR)={bool(not beta_col and or_col)})."
+    )
+    return overlap[GWAS_LOOKUP_COLUMNS]
+
+
+def gwas_overlap_bh(gwas_path: str, candidate_snps: Set[str], alpha: float = 0.05) -> pd.DataFrame:
+    """Overlap a reference SNP set with one GWAS and apply BH FDR within that trait.
+
+    The testing family is every unique candidate SNP found in the GWAS with a valid
+    p-value (see gwas_lookup for extraction and effect-size harmonization).
+
+    Returns a DataFrame with BH_COLUMNS, one row per overlapping SNP.
+    """
+    overlap = gwas_lookup(gwas_path, candidate_snps)
+    overlap["GWAS_FDR_BH"] = bh_fdr(overlap["GWAS_P"].to_numpy())
+    overlap["BH_SIGNIFICANT"] = overlap["GWAS_FDR_BH"] <= alpha
+
+    n_tested = int(overlap["GWAS_FDR_BH"].notna().sum())
+    print(
+        f"[gwas_overlap_bh] {os.path.basename(gwas_path)}: {n_tested:,} candidate SNPs tested | "
+        f"{int(overlap['BH_SIGNIFICANT'].sum()):,} significant at BH FDR <= {alpha}."
+    )
+    return overlap[BH_COLUMNS]
 
 
 # =====================================================================
@@ -306,32 +338,6 @@ def join_unique_clean(values: Iterable[object]) -> str:
     if not tokens:
         return "NA"
     return ", ".join(sorted(tokens))
-
-
-def find_common_genes(genes_str_1: object, genes_str_2: object) -> str:
-    """Return sorted comma-separated intersection of two gene lists (or 'None').
-
-    Handles tissue suffixes such as 'MAPT(Brain_Cortex)' automatically.
-    """
-    if pd.isna(genes_str_1) or pd.isna(genes_str_2):
-        return "None"
-    s1 = str(genes_str_1).strip()
-    s2 = str(genes_str_2).strip()
-    if s1 in ("None", "Error", "", "NA") or s2 in ("None", "Error", "", "NA"):
-        return "None"
-
-    set1 = {
-        g.split("(")[0].strip().upper(): g.split("(")[0].strip()
-        for g in s1.split(",")
-        if g.strip() and g.strip().upper() not in INVALID_TOKENS
-    }
-    set2 = {
-        g.split("(")[0].strip().upper()
-        for g in s2.split(",")
-        if g.strip() and g.strip().upper() not in INVALID_TOKENS
-    }
-    common_keys = sorted(set(set1.keys()) & set2)
-    return ", ".join(set1[k] for k in common_keys) if common_keys else "None"
 
 
 # =====================================================================
@@ -391,57 +397,62 @@ def save_json_cache(cache_path: Optional[str], cache_data: dict) -> None:
 
 
 # =====================================================================
-# 7. LDSC Genetic Correlation Log Parser
+# 7. LDSC munge_sumstats.py Column Mapping
 # =====================================================================
 
-def clean_ldsc_trait_name(filepath_str: str) -> str:
-    """Extract clean trait name from LDSC munged filepath (e.g. 'results/munged/AD.sumstats.gz' -> 'AD')."""
-    base = os.path.basename(str(filepath_str).strip())
-    return base.replace(".sumstats.gz", "").replace(".sumstats", "")
+MUNGE_ALIASES: Dict[str, List[str]] = {
+    "--snp": ["SNP", "snp", "rsID", "rsid"],
+    "--a1": ["A1", "a1", "Allele1", "effect_allele", "alt", "Aallele"],
+    "--a2": ["A2", "a2", "Allele2", "other_allele", "ref", "Ballele"],
+    "--p": ["P", "p", "pvalue", "p_value", "P_value", "P.value"],
+}
+MUNGE_N_ALIASES: List[str] = ["N", "n", "N_eff", "Neff", "N_EFF", "N_TOTAL", "Weight"]
 
 
-def parse_ldsc_rg_logs(log_files: Iterable[str]) -> pd.DataFrame:
-    """Parse 'Summary of Genetic Correlation Results' tables from LDSC .log files."""
-    dfs: List[pd.DataFrame] = []
+def read_gwas_header(gwas_path: Union[str, Path]) -> List[str]:
+    """Return the whitespace-split header of a plain or gzipped GWAS file."""
+    open_fn = gzip.open if is_gzipped(str(gwas_path)) else open
+    with open_fn(gwas_path, "rt", encoding="utf-8", errors="replace") as f:
+        return f.readline().strip().split()
 
-    for log_file in log_files:
-        if not os.path.exists(log_file):
-            continue
-        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
 
-        start_idx = None
-        for idx, line in enumerate(lines):
-            if "Summary of Genetic Correlation Results" in line:
-                start_idx = idx + 1
-                break
+def detect_n_column(header: Sequence[str]) -> Optional[str]:
+    """First sample-size column in `header` matching MUNGE_N_ALIASES, or None."""
+    return next((c for c in MUNGE_N_ALIASES if c in header), None)
 
-        if start_idx is None or start_idx >= len(lines):
-            continue
 
-        header = lines[start_idx].strip().split()
-        data_rows: List[List[str]] = []
-        for line in lines[start_idx + 1 :]:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("Analysis finished") or stripped.startswith("Total time"):
-                break
-            cols = stripped.split()
-            if len(cols) == len(header):
-                data_rows.append(cols)
+def munge_column_flags(
+    header: Sequence[str], n_override: object = None, n_col_override: object = None
+) -> List[str]:
+    """Map a GWAS header to munge_sumstats.py column flags.
 
-        if data_rows:
-            dfs.append(pd.DataFrame(data_rows, columns=header))
+    Sample size precedence: manual N (--N) > N column override > auto-detected N column.
+    Empty strings / None mean "not set". Raises ValueError with a readable message.
+    """
+    flags: List[str] = []
+    for ldsc_arg, possible_names in MUNGE_ALIASES.items():
+        match = next((c for c in possible_names if c in header), None)
+        if match is None:
+            raise ValueError(
+                f"No column for '{ldsc_arg}' in header {list(header)}; expected one of {possible_names}."
+            )
+        flags += [ldsc_arg, match]
 
-    if not dfs:
-        return pd.DataFrame()
-
-    df = pd.concat(dfs, ignore_index=True)
-    for col in ("rg", "se", "z", "p"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "p1" in df.columns and "p2" in df.columns:
-        df["trait1"] = df["p1"].map(clean_ldsc_trait_name)
-        df["trait2"] = df["p2"].map(clean_ldsc_trait_name)
-
-    return df
+    if n_override not in (None, ""):
+        n_value = float(n_override)
+        if n_value <= 0:
+            raise ValueError(f"Manual N must be positive, got {n_override}.")
+        flags += ["--N", str(int(n_value)) if n_value.is_integer() else repr(n_value)]
+    elif n_col_override not in (None, ""):
+        if n_col_override not in header:
+            raise ValueError(f"N column '{n_col_override}' is not in header {list(header)}.")
+        flags += ["--N-col", str(n_col_override)]
+    else:
+        n_col = detect_n_column(header)
+        if n_col is None:
+            raise ValueError(
+                f"No sample-size column in header {list(header)} (expected one of {MUNGE_N_ALIASES}). "
+                f"Set a manual N (config ldsc.n_override or the app's Munge tab)."
+            )
+        flags += ["--N-col", n_col]
+    return flags

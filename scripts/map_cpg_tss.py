@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Step 5b: Map Overlapping DNA ASM CpGs to hg19 Coordinates and GENCODE v19 Gene TSS (< 5 kb).
+Step A2: Map BH-Significant DNA ASM CpGs to hg19 Coordinates and GENCODE v19 Gene TSS (< 5 kb).
 
-1. Merges `cpg_coordinates_hg19.tsv` with `dna_asm_gwas_overlap.tsv` on `CPG_ID`.
+1. Merges `cpg_coordinates_hg19.tsv` with `{trait}_overlap_sig.tsv` on `CPG_ID`.
 2. Standardizes chromosome notation across tables (preserving `chr` prefix consistently).
 3. Queries `gencode_v19_gene_tss.tsv` on the same chromosome using binary-search interval
    bounds (`np.searchsorted` on `[CPG_POS - cutoff, CPG_POS + cutoff]`), computing:
@@ -12,7 +12,8 @@ Step 5b: Map Overlapping DNA ASM CpGs to hg19 Coordinates and GENCODE v19 Gene T
 
 Output Columns:
     CPG_ID, CHR, CPG_POS, TAG_SNP, QUERY_SNP, RELATIONSHIP,
-    GENE_SYMBOL, STRAND, TSS, DISTANCE_TO_TSS, BIOTYPE, <GWAS_P>, <GWAS_BETA>
+    GENE_SYMBOL, STRAND, TSS, DISTANCE_TO_TSS, BIOTYPE,
+    TRAIT, GWAS_P, GWAS_BETA, GWAS_FDR_BH, BH_SIGNIFICANT
 """
 
 import argparse
@@ -188,23 +189,13 @@ def map_cpg_to_tss(
 
 
 def main() -> None:
-    if "snakemake" in globals():
-        smk = globals()["snakemake"]
-        overlap_path = smk.input.overlap
-        cpg_coords_path = smk.input.cpg_coordinates
-        gene_tss_path = smk.input.gene_tss
-        output_path = smk.output[0]
-        cutoff = int(getattr(smk.params, "tss_distance_cutoff", 5000))
-        map_cpg_to_tss(overlap_path, cpg_coords_path, gene_tss_path, output_path, cutoff)
-        return
-
     parser = argparse.ArgumentParser(
         description="Map overlapping DNA ASM CpG sites to hg19 coordinates and GENCODE v19 TSS (< 5 kb)."
     )
     parser.add_argument(
         "--overlap",
         required=True,
-        help="Path to results/methylation/dna_asm_gwas_overlap.tsv",
+        help="Path to results/dna/{trait}_overlap_sig.tsv",
     )
     parser.add_argument(
         "--cpg-coords",
@@ -226,7 +217,7 @@ def main() -> None:
         "--output",
         "-o",
         required=True,
-        help="Output TSV path (results/methylation/dna_asm_cpg_gene_tss_matches.tsv)",
+        help="Output TSV path (results/dna/{trait}_cpg_tss.tsv)",
     )
     args = parser.parse_args()
     map_cpg_to_tss(

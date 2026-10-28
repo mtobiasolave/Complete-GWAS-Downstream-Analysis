@@ -1,45 +1,55 @@
 # ==============================================================================
-# LDSC & Epigenetic Pipeline Configuration (VIBRA HPC Defaults)
+# DNA & RNA Methylation x GWAS Pipeline Configuration (VIBRA HPC Defaults)
+# All paths are relative to the repository root.
 # ==============================================================================
 
-# Slurm Cluster Defaults
-slurm_partition: "irbio01"
-
-# Shell Environment & Conda Setup on Cluster
-use_conda_activation: true
-conda_sh: "/aplic/anaconda/2024.02/etc/profile.d/conda.sh"
-ldsc_env: "ldsc"
-snakemake_env: "snakemake_env"
-python_bin: "python"
-
-# LDSC Software & Script Paths (relative to project root)
-ldsc_script: "../ldsc/ldsc.py"
-munge_script: "../ldsc/munge_sumstats.py"
-
-# Reference Panels & LD Scores (relative to project root)
-snplist: "data/reference/w_hm3.snplist"
-ld_ref: "data/reference/LDscores"
-
-# Epigenetic Panels
-meth_types:
-  - "DNA_ASM"
-  - "RNA_m6A"
-
-# GWAS Traits & Summary Statistics Mapping
-# By default, Snakefile automatically discovers all GWAS files in data/raw_data/
-# (e.g., *_gwas.txt, *_gwas.tsv, *.txt.gz). You can optionally list additional
-# traits or custom file paths below if stored outside the standard naming pattern.
+# GWAS Traits & Summary Statistics
+# Every GWAS file in raw_data_dir (e.g. *_gwas.txt, *_gwas.txt.gz, *.tsv) is discovered
+# automatically. Leave `traits` empty to analyze all of them, or restrict a run with a list
+# here or on the command line:  snakemake --config traits=TraitA,TraitB ...
+raw_data_dir: "data/raw_data"
 traits: []
+# Optional extra traits stored outside raw_data_dir (trait name -> relative file path)
 gwas_sumstats: {}
 
-# DNA ASM Mapping & CpG-to-TSS Distance Parameters
-methylation:
-  dna_mapping_table: "data/methylation/DNA_ASM_mapping_table.tsv"
+# GWAS Sumstats Munging (LDSC munge_sumstats.py, sibling ../ldsc repository)
+# Output: results/munged/{trait}.sumstats.gz. Sample size per trait: manual N (n_override)
+# > N column (n_col_override) > auto-detected column (N, N_eff, Neff, N_EFF, N_TOTAL, Weight).
+ldsc:
+  munge_script: "../ldsc/munge_sumstats.py"
+  # Genetic correlation (target `rg`): ldsc.py --rg with 1000G HapMap3 LD scores (chromosomes 1-22)
+  ldsc_script: "../ldsc/ldsc.py"
+  ld_ref_chr: "data/reference/LDscores/"
+  w_ld_chr: "data/reference/LDscores/"
+  merge_alleles: "data/reference/w_hm3.snplist"
+  chunksize: 500000
+  n_override:
+    SUD2023: 1025550
+  n_col_override: {}
+
+# Multiple-Testing Correction
+# Benjamini-Hochberg FDR level, applied per trait: DNA across tag SNPs (one test per tag),
+# RNA across the reference SNPs found in its GWAS
+fdr_alpha: 0.05
+
+# Track A: DNA Methylation (DNA ASM Tag SNPs & LD Proxies with CpG Annotations)
+dna:
+  mapping_table: "data/methylation/DNA_ASM_mapping_table.tsv"
   cpg_coordinates: "data/annotations/cpg_coordinates_hg19.tsv"
   gene_tss: "data/annotations/gencode_v19_gene_tss.tsv"
   tss_distance_cutoff: 5000
+  # Tags absent from a GWAS: "best_ld_proxy" tests them via their highest-LD_R2 proxy, "none" skips them
+  tag_fallback: "best_ld_proxy"
 
-# GTEx v10 Brain eQTL Lookup Parameters (13 Brain Regions)
+# Track B: RNA Methylation (RNA m6A SNP List)
+rna:
+  snp_list: "data/methylation/RNA_m6A_SNPlist.txt"
+  # Step B2: genes each BH-significant SNP falls inside (Ensembl VEP REST; GRCh37 matches the
+  # hg19 coordinates of Track A). Use "https://rest.ensembl.org" (and a new cache file) for GRCh38.
+  ensembl_server: "https://grch37.rest.ensembl.org"
+  ensembl_cache_file: "results/.cache/ensembl_grch37_genes_cache.json"
+
+# GTEx v10 Brain eQTL Lookup Parameters (13 Brain Regions, Track A only)
 gtex:
   brain_tissues:
     - "Brain_Amygdala"
@@ -56,16 +66,4 @@ gtex:
     - "Brain_Spinal_cord_cervical_c-1"
     - "Brain_Substantia_nigra"
   p_threshold: 0.05
-  gwas_p_threshold: 0.001
-  cache_file: "results/methylation/.gtex_eqtl_cache.json"
-
-# Cross-Trait DNA ASM Recurrence Defaults
-cross_trait:
-  fdr_method: "storey"
-  min_recurrence: 2
-  fdr_threshold: 0.05
-
-
-
-
-
+  cache_file: "results/.cache/gtex_eqtl_cache.json"

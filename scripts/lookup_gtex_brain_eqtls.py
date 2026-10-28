@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Step 5c: Query GTEx v10 Across 13 Brain Tissues for DNA ASM Overlapping Variants.
+Step A3: Query GTEx v10 Across 13 Brain Tissues for BH-Significant DNA ASM Variants.
 
-Key Improvements:
-1. Prioritizes candidate variants reaching either candidate-space Storey q <= 0.05
-   or GWAS_P <= gwas_p_threshold (default 1e-3), avoiding tens of thousands of
-   redundant HTTP calls on null variants while supporting full queries if desired.
-2. Uses a persistent atomic JSON cache (`results/methylation/.gtex_eqtl_cache.json`)
+Key Features:
+1. Queries every unique QUERY_SNP in `{trait}_overlap_sig.tsv` (BH FDR <= 5% at Step A1).
+2. Uses a persistent atomic JSON cache (`results/.cache/gtex_eqtl_cache.json`)
    shared across traits so overlapping SNPs are never queried twice.
 3. Resolves rsID -> GTEx variantId in parallel threads and queries the GTEx v2
    `singleTissueEqtl` endpoint in batches of 40 variantIds per HTTP request across
@@ -27,18 +25,22 @@ import requests
 from common_utils import (
     DEFAULT_BRAIN_TISSUES,
     TISSUE_TYPO_FIXES,
+    PROJECT_ROOT,
     create_http_session,
     load_json_cache,
     normalize_tissues,
     save_json_cache,
-    storey_qvalues,
 )
 
-DEFAULT_CACHE_FILE = "results/methylation/.gtex_eqtl_cache.json"
+DEFAULT_CACHE_FILE = str(PROJECT_ROOT / "results" / ".cache" / "gtex_eqtl_cache.json")
 
 
 def fetch_variant_id(rsid: str, session: requests.Session) -> tuple:
-    """Resolve rsID to GTEx v10 variantId (e.g. chr12_2203945_A_G_b38)."""
+    """Resolve rsID to GTEx v10 variantId (e.g. chr12_2203945_A_G_b38).
+
+    Returns (rsid, variant_id_or_None, resolved); resolved is False when the request
+    itself failed, so the SNP is not cached as "absent from GTEx".
+    """
     url = "https://gtexportal.org/api/v2/dataset/variant"
     params = {"snpId": rsid, "datasetId": "gtex_v10"}
     for attempt in range(3):
@@ -49,20 +51,23 @@ def fetch_variant_id(rsid: str, session: requests.Session) -> tuple:
                 if data:
                     vid = data[0].get("variantId")
                     if vid:
-                        return rsid, vid
-                return rsid, None
+                        return rsid, vid, True
+                return rsid, None, True
             if resp.status_code == 429:
                 time.sleep(1.5 * (attempt + 1))
                 continue
         except Exception:
             time.sleep(0.5 * (attempt + 1))
-    return rsid, None
+    return rsid, None, False
 
 
 def fetch_eqtl_batch(
     variant_ids: list, tissues: list, session: requests.Session
 ) -> list:
-    """Query singleTissueEqtl for a batch of GTEx variantIds across configured brain tissues."""
+    """Query singleTissueEqtl for a batch of GTEx variantIds across configured brain tissues.
+
+    Returns (items, complete); complete is False if any page could not be retrieved.
+    """
     url = "https://gtexportal.org/api/v2/association/singleTissueEqtl"
     all_items = []
     page = 0
@@ -87,45 +92,14 @@ def fetch_eqtl_batch(
                     page += 1
                     success = True
                     if page >= max_pages or not data:
-                        return all_items
+                        return all_items, True
                     break
                 if resp.status_code == 429:
                     time.sleep(1.5 * (attempt + 1))
             except Exception:
                 time.sleep(0.5 * (attempt + 1))
         if not success:
-            break
-    return all_items
-
-
-def select_candidate_snps(
-    overlap_df: pd.DataFrame, gwas_p_threshold: float, fdr_threshold: float = 0.05
-) -> list:
-    """
-    Select unique QUERY_SNPs to query in GTEx:
-    Retains variants with GWAS_P <= gwas_p_threshold OR candidate-space Storey q <= fdr_threshold.
-    """
-    p_col = "GWAS_P" if "GWAS_P" in overlap_df.columns else None
-    if p_col is None:
-        p_candidates = [c for c in overlap_df.columns if c.upper().startswith("P")]
-        p_col = p_candidates[0] if p_candidates else None
-
-    unique_df = overlap_df.drop_duplicates(subset=["QUERY_SNP"]).copy()
-    if not p_col or gwas_p_threshold >= 1.0:
-        return unique_df["QUERY_SNP"].dropna().astype(str).str.strip().tolist()
-
-    unique_df[p_col] = pd.to_numeric(unique_df[p_col], errors="coerce")
-    unique_df = unique_df.dropna(subset=["QUERY_SNP", p_col])
-
-    mask_p = unique_df[p_col] <= gwas_p_threshold
-    if len(unique_df) > 10:
-        qvals = storey_qvalues(unique_df[p_col].to_numpy(dtype=float))
-        mask_q = qvals <= fdr_threshold
-        selected = unique_df[mask_p | mask_q]
-    else:
-        selected = unique_df[mask_p]
-
-    return selected["QUERY_SNP"].astype(str).str.strip().tolist()
+            return all_items, False
 
 
 def run_lookup_gtex(
@@ -133,7 +107,6 @@ def run_lookup_gtex(
     output_path: str,
     brain_tissues: list = None,
     p_threshold: float = 0.05,
-    gwas_p_threshold: float = 0.001,
     cache_path: str = DEFAULT_CACHE_FILE,
     max_workers: int = 16,
 ) -> pd.DataFrame:
@@ -145,12 +118,10 @@ def run_lookup_gtex(
         raise ValueError(f"Missing QUERY_SNP column in {overlap_path}")
 
     overlap_df["QUERY_SNP"] = overlap_df["QUERY_SNP"].astype(str).str.strip()
-    total_unique = overlap_df["QUERY_SNP"].nunique()
-
-    candidate_snps = select_candidate_snps(overlap_df, gwas_p_threshold=gwas_p_threshold)
+    candidate_snps = sorted(overlap_df["QUERY_SNP"].dropna().unique())
     print(
-        f"[lookup_gtex] {os.path.basename(overlap_path)}: {len(candidate_snps):,} / {total_unique:,} "
-        f"unique QUERY_SNPs selected (GWAS P <= {gwas_p_threshold} or Storey q <= 0.05)."
+        f"[lookup_gtex] {os.path.basename(overlap_path)}: {len(candidate_snps):,} "
+        f"unique BH-significant QUERY_SNPs to annotate."
     )
 
     cache = load_json_cache(cache_path)
@@ -162,8 +133,8 @@ def run_lookup_gtex(
 
     if uncached_snps:
         session = create_http_session(pool_size=max_workers + 4)
-        rsid_to_vid = {}
         vid_to_rsids = {}
+        failed_snps = set()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -171,13 +142,13 @@ def run_lookup_gtex(
                 for rsid in uncached_snps
             }
             for future in as_completed(futures):
-                rsid, vid = future.result()
-                rsid_to_vid[rsid] = vid
-                if vid:
+                rsid, vid, resolved = future.result()
+                if not resolved:
+                    failed_snps.add(rsid)
+                elif vid:
                     vid_to_rsids.setdefault(vid, []).append(rsid)
 
-        for rsid in uncached_snps:
-            cache[rsid] = []
+        new_hits = {rsid: [] for rsid in uncached_snps if rsid not in failed_snps}
 
         all_vids = list(vid_to_rsids.keys())
         batch_size = 40
@@ -186,12 +157,16 @@ def run_lookup_gtex(
         ]
 
         with ThreadPoolExecutor(max_workers=min(8, max(1, len(batches)))) as executor:
-            batch_futures = [
-                executor.submit(fetch_eqtl_batch, batch, tissues, session)
+            batch_futures = {
+                executor.submit(fetch_eqtl_batch, batch, tissues, session): batch
                 for batch in batches
-            ]
+            }
             for future in as_completed(batch_futures):
-                items = future.result()
+                items, complete = future.result()
+                if not complete:
+                    for vid in batch_futures[future]:
+                        failed_snps.update(vid_to_rsids[vid])
+                    continue
                 for item in items:
                     vid = item.get("variantId")
                     snp_id = item.get("snpId")
@@ -203,11 +178,22 @@ def run_lookup_gtex(
                         "nes": item.get("nes"),
                     }
                     for rsid in target_rsids:
-                        if rsid in cache:
-                            cache[rsid].append(hit_record)
+                        if rsid in new_hits:
+                            new_hits[rsid].append(hit_record)
 
-        save_json_cache(cache_path, cache)
-        print(f"[lookup_gtex] Updated persistent GTEx cache at {cache_path}")
+        # Only fully retrieved SNPs are cached; failed requests are retried on the next run
+        for rsid in failed_snps:
+            new_hits.pop(rsid, None)
+        cache.update(new_hits)
+        save_json_cache(cache_path, new_hits)
+        print(f"[lookup_gtex] Cached {len(new_hits):,} newly queried SNPs at {cache_path}")
+
+        if failed_snps:
+            raise RuntimeError(
+                f"[lookup_gtex] GTEx requests failed for {len(failed_snps):,} SNPs "
+                f"(e.g. {sorted(failed_snps)[:5]}). Successful results were cached; "
+                f"re-run the pipeline to retry the remaining SNPs."
+            )
 
     raw_rows = []
     all_overlap_snps = overlap_df["QUERY_SNP"].dropna().unique()
@@ -277,37 +263,13 @@ def run_lookup_gtex(
 
 
 def main() -> None:
-    if "snakemake" in globals():
-        smk = globals()["snakemake"]
-        overlap_path = smk.input.overlap
-        output_path = smk.output[0]
-        tissues = getattr(smk.params, "brain_tissues", DEFAULT_BRAIN_TISSUES)
-        p_thresh = float(getattr(smk.params, "p_threshold", 0.05))
-        gwas_p_thresh = float(getattr(smk.params, "gwas_p_threshold", 0.001))
-        cache_file = getattr(smk.params, "cache_file", DEFAULT_CACHE_FILE)
-        run_lookup_gtex(
-            overlap_path,
-            output_path,
-            brain_tissues=tissues,
-            p_threshold=p_thresh,
-            gwas_p_threshold=gwas_p_thresh,
-            cache_path=cache_file,
-        )
-        return
-
     parser = argparse.ArgumentParser(
-        description="Query GTEx v10 across 13 brain tissues for DNA ASM overlapping variants."
+        description="Query GTEx v10 across 13 brain tissues for BH-significant DNA ASM variants."
     )
-    parser.add_argument("--overlap", required=True, help="Input dna_asm_{trait}_gwas_overlap.tsv")
-    parser.add_argument("--output", "-o", required=True, help="Output dna_asm_{trait}_gtex_brain_eqtls.tsv")
+    parser.add_argument("--overlap", required=True, help="Input results/dna/{trait}_overlap_sig.tsv")
+    parser.add_argument("--output", "-o", required=True, help="Output results/dna/{trait}_gtex_brain_eqtls.tsv")
     parser.add_argument("--tissues", nargs="+", default=DEFAULT_BRAIN_TISSUES, help="GTEx brain tissue IDs")
     parser.add_argument("--p-threshold", type=float, default=0.05, help="GTEx eQTL p-value cutoff")
-    parser.add_argument(
-        "--gwas-p-threshold",
-        type=float,
-        default=0.001,
-        help="GWAS p-value pre-filter (variants with Storey q <= 0.05 are also included)",
-    )
     parser.add_argument("--cache-file", default=DEFAULT_CACHE_FILE, help="Persistent JSON cache path")
     parser.add_argument("--workers", type=int, default=16, help="Max concurrent HTTP workers")
     args = parser.parse_args()
@@ -317,7 +279,6 @@ def main() -> None:
         args.output,
         brain_tissues=args.tissues,
         p_threshold=args.p_threshold,
-        gwas_p_threshold=args.gwas_p_threshold,
         cache_path=args.cache_file,
         max_workers=args.workers,
     )

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Step 5d: Compare Proximal CpG TSS Genes (< 5 kb) with GTEx v10 Brain eQTL Target Genes.
+Step A4: Compare Proximal CpG TSS Genes (< 5 kb) with GTEx v10 Brain eQTL Target Genes.
 
 Logic:
 1. Nearest TSS Filtering:
-   Deduplicates `dna_asm_{trait}_cpg_gene_tss_matches.tsv` by (CPG_ID, TAG_SNP, QUERY_SNP, GENE_SYMBOL)
+   Deduplicates `{trait}_cpg_tss.tsv` by (CPG_ID, TAG_SNP, QUERY_SNP, GENE_SYMBOL)
    after sorting on DISTANCE_TO_TSS ascending, retaining only the single closest TSS per gene.
 2. Outer Join & Concordance Classification:
    Merges deduplicated TSS matches with aggregated GTEx brain eQTL hits on QUERY_SNP and assigns:
@@ -16,14 +16,13 @@ Logic:
      * "GTEX_ONLY": GTEx brain eQTL hit exists, but no gene TSS within 5 kb of CpG
      * "NONE_WITHIN_5KB": Neither proximal TSS gene nor GTEx brain eQTL hit
 3. Sorting & Export:
-   Exports full comparison table (`dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv`) and
-   filtered high-priority concordant summary (`dna_asm_{trait}_concordant_genes_summary.tsv`).
+   Exports the per-trait comparison table (`{trait}_concordance.tsv`); concordant rows are
+   those with IS_CONCORDANT == True. GWAS_PVALUE, GWAS_FDR_BH and GWAS_BETA are those of the
+   block's TESTED_SNP (Step A1); QUERY_IN_GWAS flags proxies absent from the GWAS.
 """
 
 import argparse
 import os
-import re
-import sys
 
 import numpy as np
 import pandas as pd
@@ -44,30 +43,20 @@ OUTPUT_COLUMNS = [
     "MIN_GTEX_PVALUE",
     "MEAN_GTEX_SLOPE",
     "GWAS_PVALUE",
+    "GWAS_FDR_BH",
     "GWAS_BETA",
+    "TESTED_SNP",
+    "LD_R2",
+    "QUERY_IN_GWAS",
 ]
-
-
-def infer_trait_name(filepath: str) -> str:
-    base = os.path.basename(filepath)
-    m = re.match(r"^dna_asm_(.+)_cpg_gene_tss_matches\.tsv$", base)
-    if m:
-        return m.group(1)
-    parts = os.path.normpath(filepath).split(os.sep)
-    if len(parts) >= 2 and parts[-2] not in ("methylation", "results"):
-        return parts[-2]
-    return "UNKNOWN_TRAIT"
 
 
 def run_compare_tss_gtex(
     tss_path: str,
     gtex_path: str,
-    output_full_path: str,
-    output_concordant_path: str,
-    trait_name: str = None,
-) -> tuple:
-    trait = trait_name or infer_trait_name(tss_path)
-
+    output_path: str,
+    trait: str,
+) -> pd.DataFrame:
     tss_df = pd.read_csv(tss_path, sep="\t", low_memory=False)
     gtex_df = pd.read_csv(gtex_path, sep="\t", low_memory=False)
 
@@ -81,6 +70,7 @@ def run_compare_tss_gtex(
         tss_df["DISTANCE_TO_TSS"], errors="coerce"
     ).astype("Int64")
     tss_df["GWAS_PVALUE"] = pd.to_numeric(tss_df["GWAS_PVALUE"], errors="coerce")
+    tss_df["GWAS_FDR_BH"] = pd.to_numeric(tss_df["GWAS_FDR_BH"], errors="coerce")
     tss_df["GWAS_BETA"] = pd.to_numeric(tss_df["GWAS_BETA"], errors="coerce")
 
     for col in ("CPG_ID", "TAG_SNP", "QUERY_SNP", "RELATIONSHIP", "TSS_GENE_SYMBOL"):
@@ -199,13 +189,10 @@ def run_compare_tss_gtex(
     )
 
     full_df = merged[OUTPUT_COLUMNS]
-    concordant_df = full_df[full_df["IS_CONCORDANT"] == True].copy()
+    concordant_df = full_df[full_df["IS_CONCORDANT"]]
 
-    os.makedirs(os.path.dirname(output_full_path) or ".", exist_ok=True)
-    os.makedirs(os.path.dirname(output_concordant_path) or ".", exist_ok=True)
-
-    full_df.to_csv(output_full_path, sep="\t", index=False, na_rep="NA")
-    concordant_df.to_csv(output_concordant_path, sep="\t", index=False, na_rep="NA")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    full_df.to_csv(output_path, sep="\t", index=False, na_rep="NA")
 
     cat_counts = full_df["MATCH_CATEGORY"].value_counts().to_dict()
     n_conc_genes = concordant_df["TSS_GENE_SYMBOL"].nunique() if not concordant_df.empty else 0
@@ -218,47 +205,21 @@ def run_compare_tss_gtex(
         f"GTEX_ONLY={cat_counts.get('GTEX_ONLY', 0):,} | "
         f"TSS_ONLY={cat_counts.get('TSS_ONLY', 0):,}"
     )
-    print(f"[compare_tss_gtex] Full comparison saved to: {output_full_path}")
-    print(f"[compare_tss_gtex] Concordant summary saved to: {output_concordant_path}")
-    return full_df, concordant_df
+    print(f"[compare_tss_gtex] Comparison saved to: {output_path}")
+    return full_df
 
 
 def main() -> None:
-    if "snakemake" in globals():
-        smk = globals()["snakemake"]
-        tss_path = smk.input.tss
-        gtex_path = smk.input.gtex
-        output_full = smk.output.full
-        output_concordant = smk.output.concordant
-        trait = getattr(smk.wildcards, "trait", None)
-        run_compare_tss_gtex(tss_path, gtex_path, output_full, output_concordant, trait)
-        return
-
     parser = argparse.ArgumentParser(
         description="Compare CpG proximal TSS genes (< 5 kb) with GTEx brain eQTL target genes."
     )
-    parser.add_argument("--tss", required=True, help="Input dna_asm_{trait}_cpg_gene_tss_matches.tsv")
-    parser.add_argument("--gtex", required=True, help="Input dna_asm_{trait}_gtex_brain_eqtls.tsv")
-    parser.add_argument(
-        "--output-full",
-        required=True,
-        help="Output dna_asm_{trait}_tss_vs_gtex_full_comparison.tsv",
-    )
-    parser.add_argument(
-        "--output-concordant",
-        required=True,
-        help="Output dna_asm_{trait}_concordant_genes_summary.tsv",
-    )
-    parser.add_argument("--trait", default=None, help="Trait identifier")
+    parser.add_argument("--tss", required=True, help="Input results/dna/{trait}_cpg_tss.tsv")
+    parser.add_argument("--gtex", required=True, help="Input results/dna/{trait}_gtex_brain_eqtls.tsv")
+    parser.add_argument("--output", "-o", required=True, help="Output results/dna/{trait}_concordance.tsv")
+    parser.add_argument("--trait", required=True, help="Trait identifier")
     args = parser.parse_args()
 
-    run_compare_tss_gtex(
-        args.tss,
-        args.gtex,
-        args.output_full,
-        args.output_concordant,
-        trait_name=args.trait,
-    )
+    run_compare_tss_gtex(args.tss, args.gtex, args.output, args.trait)
 
 
 if __name__ == "__main__":
