@@ -1,313 +1,325 @@
 # ==============================================================================
-# LDSC & GC Automated Pipeline (VIBRA HPC)
+# DNA & RNA Methylation x GWAS Pipeline (VIBRA HPC)
 # Compatible with Snakemake 9 & Slurm Executor Plugin
+#
+# Targets:
+#   all : Track A (DNA methylation) + Track B (RNA methylation)
+#   dna : Track A only -> results/dna/pleiotropy_dna.tsv
+#   rna : Track B only -> results/rna/pleiotropy_rna.tsv (with Ensembl GRCh37 overlapping genes)
+#   munge : LDSC munge_sumstats.py -> results/munged/{trait}.sumstats.gz
+#   rg    : LDSC genetic correlation for the pairs in config `rg`
+#           -> results/ldsc_rg/{trait1}__{trait2}.log + results/ldsc_rg/rg_summary.tsv
+#
+# Local:  snakemake --cores 2 all [--config traits=TraitA,TraitB]
+# Slurm:  snakemake --profile profiles/slurm all
+# rg:     snakemake --cores 2 rg --config traits=A,B,C 'rg={"traits": ["A", "B", "C"], "target": ""}'
 # ==============================================================================
 
-import os
+import re
 import sys
-import itertools
+from pathlib import Path
 
-# Ensure logs directory exists for cluster execution
-os.makedirs("logs", exist_ok=True)
+# Resolve every relative path below from the repository root, wherever snakemake is launched
+workdir: workflow.basedir
+
+sys.path.insert(0, str(Path(workflow.basedir) / "scripts"))
+from common_utils import discover_gwas, munge_column_flags, read_gwas_header
+from ldsc_rg_summary import pair_stem, rg_pairs
 
 # Load configuration file (merges local overrides if config_local.yaml exists)
 configfile: "config.yaml"
-if os.path.exists("config_local.yaml"):
+if Path("config_local.yaml").exists():
     configfile: "config_local.yaml"
 
-# ----- TRAIT & PAIR DETECTION ----- #
-# 1. Automatically detect every trait in your raw_data folder
-TRAITS, = glob_wildcards("data/raw_data/{trait}_gwas.txt")
+# Run scripts with the interpreter running Snakemake (the activated snakemake9_env);
+# Slurm jobs are submitted with --export=ALL and resolve the same environment
+PYTHON = f'"{Path(sys.executable).as_posix()}"'
+FDR_ALPHA = float(config.get("fdr_alpha", 0.05))
+LDSC = config.get("ldsc") or {}
 
-# 2. Automatically generate every unique pair (e.g., A_B, A_C, B_C)
-PAIRS = [f"{t1}_{t2}" for t1, t2 in itertools.combinations(TRAITS, 2)]
-# -----                        ----- #
+# ----- TRAIT DETECTION ----- #
+# 1. Discover all GWAS summary statistics in raw_data_dir, plus any extra configured paths
+RAW_DATA_DIR = config.get("raw_data_dir", "data/raw_data")
+GWAS_FILES = discover_gwas(RAW_DATA_DIR)
+GWAS_FILES.update(config.get("gwas_sumstats") or {})
 
-# ----- METHYLATION CONFIGURATION ----- #
-METH_TYPES = config.get("meth_types", ["DNA_ASM", "RNA_m6A"])
+# 2. Restrict to the requested traits (list in config, or "A,B,C" from --config traits=A,B,C)
+def requested_traits():
+    selected = config.get("traits") or []
+    if isinstance(selected, str):
+        selected = selected.split(",")
+    selected = sorted({str(t).strip() for t in selected if str(t).strip()})
+    return selected or sorted(GWAS_FILES)
+
+TRAITS = requested_traits()
+MISSING_TRAITS = [t for t in TRAITS if t not in GWAS_FILES]
+if MISSING_TRAITS:
+    raise ValueError(
+        f"No GWAS file found for trait(s) {MISSING_TRAITS} in '{RAW_DATA_DIR}/'. "
+        f"Available traits: {sorted(GWAS_FILES)}"
+    )
+
+# 3. Genetic correlation pairs: all-vs-all of rg.traits, or rg.target vs each of rg.traits
+RG = config.get("rg") or {}
+RG_PAIRS = rg_pairs(RG.get("traits") or [], RG.get("target") or None)
+
+wildcard_constraints:
+    trait="|".join(re.escape(t) for t in TRAITS) or "[^/]+",
+    # Pair outputs are {trait1}__{trait2}; trait names must not contain "__"
+    trait1="(?:(?!__)[^/])+",
+    trait2="(?:(?!__)[^/])+"
+# -----                ----- #
+
+localrules: all, dna, rna, munge, rg, rg_summary, pleiotropy_dna, pleiotropy_rna
 
 # ==========================================
-# PIPELINE SHORTCUTS (DUMMY RULES)
+# PIPELINE TARGETS
 # ==========================================
 
-# 1. Run everything (Munge -> Correlations -> Plots)
-# Snakemake 9 Profile Command: snakemake --profile profiles/slurm all
 rule all:
     input:
-        "results/figures/rg_heatmap.pdf",
-        "results/figures/rg_network.pdf"
+        "results/dna/pleiotropy_dna.tsv",
+        "results/rna/pleiotropy_rna.tsv"
 
-# 2. Run correlations and stop (No plotting)
-# Snakemake 9 Profile Command: snakemake --profile profiles/slurm correlations
-rule correlations:
+rule dna:
     input:
-        expand("results/ldsc_rg/{pair}.log", pair=PAIRS)
+        "results/dna/pleiotropy_dna.tsv"
 
-# 3. Run single-trait SNP heritability (h2) only
-# Snakemake 9 Profile Command: snakemake --profile profiles/slurm heritability
-rule heritability:
+rule rna:
     input:
-        expand("results/ldsc_h2/{trait}_h2.log", trait=TRAITS)
+        "results/rna/pleiotropy_rna.tsv"
 
-# 4. Only prep the raw GWAS data and stop
-# Snakemake 9 Profile Command: snakemake --profile profiles/slurm munge_only
-rule munge_only:
+rule munge:
     input:
         expand("results/munged/{trait}.sumstats.gz", trait=TRAITS)
 
-# 5. Run methylation overlap analysis step only
-# Snakemake 9 Profile Command: snakemake --profile profiles/slurm --jobs 10 methylation
-rule methylation:
+rule rg:
     input:
-        expand(
-            "results/methylation/{meth}_{trait}_overlap.txt",
-            meth=METH_TYPES,
-            trait=TRAITS
-        ),
-        expand(
-            "results/methylation/{meth}_{trait}_overlap_fullheaders.txt",
-            meth=METH_TYPES,
-            trait=TRAITS
-        )
-
-def get_col_flags(wildcards, input):
-    """Reads the first line of the GWAS file and matches headers to LDSC flags."""
-    # Open the file and read just the first line, splitting it by tabs or spaces
-    with open(input.sumstats, 'r') as f:
-        header = f.readline().strip().split()
-        
-    # Your master dictionary of all possible column names
-    aliases = {
-        "--snp": ["SNP", "snp", "rsID", "rsid"],
-        "--a1": ["A1", "a1", "Allele1", "effect_allele", "alt", "Aallele"],
-        "--a2": ["A2", "a2", "Allele2", "other_allele", "ref", "Ballele"],
-        "--p": ["P", "p", "pvalue", "p_value", "P_value", "P.value"],
-        "--N-col": ["N", "n", "N_eff", "Neff", "N_EFF", "N_TOTAL", "Weight"]
-    }
-
-    # Dictionary for sumstats that lack an N column, add more if needed
-    constant_n = {
-        "SUD2023": "1025550"
-    }
-    
-    flags = []
-    for ldsc_arg, possible_names in aliases.items():
-        # Look for the first name in our list that actually exists in the file's header
-        match = next((col for col in possible_names if col in header), None)
-        
-        if match:
-            flags.extend([ldsc_arg, match]) # e.g., adds "--snp" and "rsid"
-        else:
-            # Fallback logic for missing N
-            if ldsc_arg == "--N-col" and wildcards.trait in constant_n:
-                flags.extend(["--N", constant_n[wildcards.trait]]) # Use --N instead of --N-col
-            else:
-                # If no match is found, crash with a helpful error message
-                raise ValueError(
-                    f"\nERROR: Could not find a match for '{ldsc_arg}' in {input.sumstats}.\n"
-                    f"File header contains: {header}\n"
-                    f"Please add the correct column name to the aliases dictionary in the Snakefile.\n"
-                    f"Or if 'N' is missing, add the trait to the constant_n dictionary with its sample size.\n"
-                )
-            
-    # Joins the list into a single string: "--snp rsid --a1 Allele1 --a2 Allele2 ..."
-    return " ".join(flags)
-
-# Helper to format conda environment activation if enabled
-def get_env_setup(env_key):
-    if config.get("use_conda_activation", True):
-        conda_sh = config.get("conda_sh", "/aplic/anaconda/2024.02/etc/profile.d/conda.sh")
-        target_env = config.get(env_key, "ldsc")
-        return f"source {conda_sh}\n        conda activate {target_env}\n\n        "
-    return ""
-
-# Helper to resolve the Python interpreter (uses active Snakemake Python when running locally)
-def get_python_bin():
-    py_cfg = config.get("python_bin", "python")
-    if not config.get("use_conda_activation", True) and py_cfg == "python":
-        return f'"{sys.executable.replace(chr(92), "/")}"'
-    return py_cfg
+        "results/ldsc_rg/rg_summary.tsv"
 
 # ------------------------------------------------------------------------------
-# Step 1: Munge Summary Statistics
+# Munge GWAS Summary Statistics with LDSC munge_sumstats.py (Per-Trait)
 # ------------------------------------------------------------------------------
+def munge_flags(wildcards, input):
+    """Column flags from the GWAS header plus the trait's manual N / N column overrides."""
+    return " ".join(munge_column_flags(
+        read_gwas_header(input.sumstats),
+        n_override=(LDSC.get("n_override") or {}).get(wildcards.trait),
+        n_col_override=(LDSC.get("n_col_override") or {}).get(wildcards.trait),
+    ))
+
 rule munge_sumstats:
     input:
-        sumstats="data/raw_data/{trait}_gwas.txt",
-        snplist=config.get("snplist", "data/reference/w_hm3.snplist")
+        sumstats=lambda wildcards: GWAS_FILES[wildcards.trait],
+        # ancient(): updating the LDSC repo or reference must not force re-munging
+        merge_alleles=ancient(LDSC.get("merge_alleles", "data/reference/w_hm3.snplist")),
+        script=ancient(LDSC.get("munge_script", "../ldsc/munge_sumstats.py"))
     output:
         "results/munged/{trait}.sumstats.gz"
-    priority: 50
+    log:
+        # LDSC writes {out}.log itself (buffered); stdout carries the same messages live
+        ldsc="results/munged/{trait}.log",
+        stdout="logs/munge/{trait}.log"
     params:
-        # LDSC expects the output prefix without the '.sumstats.gz' extension
         out_prefix="results/munged/{trait}",
-        col_flags=get_col_flags,
-        env_setup=lambda wildcards: get_env_setup("ldsc_env"),
-        python_bin=get_python_bin(),
-        munge_script=config.get("munge_script", "../ldsc/munge_sumstats.py"),
-        # Legacy parameter compatibility
-        time="06:00:00",
-        partition=config.get("slurm_partition", "irbio01")
-    resources:
-        mem_mb=16000,
-        cpus=1,
-        runtime=360,
-        slurm_partition=config.get("slurm_partition", "irbio01"),
-        slurm_extra="'--output=logs/munge_sumstats_%j.out --error=logs/munge_sumstats_%j.err'"
+        col_flags=munge_flags,
+        chunksize=LDSC.get("chunksize", 500000)
     shell:
         """
-        {params.env_setup}{params.python_bin} {params.munge_script} \
-            --sumstats {input.sumstats} \
-            --merge-alleles {input.snplist} \
-            --out {params.out_prefix} \
-            {params.col_flags} \
-            --chunksize 500000
+        {PYTHON} -u {input.script}             --sumstats {input.sumstats}             --merge-alleles {input.merge_alleles}             --out {params.out_prefix}             {params.col_flags}             --chunksize {params.chunksize}             > {log.stdout} 2>&1
         """
 
 # ------------------------------------------------------------------------------
-# Step 1b: Single-Trait SNP Heritability (h2)
-# ------------------------------------------------------------------------------
-rule ldsc_h2:
-    input:
-        sumstats="results/munged/{trait}.sumstats.gz",
-        all_munged=expand("results/munged/{t}.sumstats.gz", t=TRAITS)
-    output:
-        "results/ldsc_h2/{trait}_h2.log"
-    priority: 20
-    params:
-        out_prefix="results/ldsc_h2/{trait}_h2",
-        ld_ref=config.get("ld_ref", "data/reference/LDscores"),
-        env_setup=lambda wildcards: get_env_setup("ldsc_env"),
-        python_bin=get_python_bin(),
-        ldsc_script=config.get("ldsc_script", "../ldsc/ldsc.py"),
-        time="01:00:00",
-        partition=config.get("slurm_partition", "irbio01")
-    resources:
-        mem_mb=16000,
-        cpus=1,
-        runtime=60,
-        slurm_partition=config.get("slurm_partition", "irbio01"),
-        slurm_extra="'--output=logs/ldsc_h2_%j.out --error=logs/ldsc_h2_%j.err'"
-    shell:
-        """
-        {params.env_setup}{params.python_bin} {params.ldsc_script} \
-            --h2 {input.sumstats} \
-            --ref-ld-chr {params.ld_ref}/ \
-            --w-ld-chr {params.ld_ref}/ \
-            --out {params.out_prefix}
-        """
-
-# ------------------------------------------------------------------------------
-# Step 2: Perform LD Score Regression to Estimate Genetic Correlations
+# Genetic Correlation (rg) with LDSC ldsc.py --rg (Per Trait Pair)
 # ------------------------------------------------------------------------------
 rule ldsc_rg:
     input:
-        # Using wildcards here allows you to pair any two traits dynamically
-        # all_munged ensures all traits finish Step 1 (munge) before Step 2 starts
-        trait1="results/munged/{trait1}.sumstats.gz",
-        trait2="results/munged/{trait2}.sumstats.gz",
-        all_munged=expand("results/munged/{t}.sumstats.gz", t=TRAITS)
+        sumstats1="results/munged/{trait1}.sumstats.gz",
+        sumstats2="results/munged/{trait2}.sumstats.gz",
+        # ancient(): updating the LDSC repo must not force re-running every pair
+        script=ancient(LDSC.get("ldsc_script", "../ldsc/ldsc.py"))
     output:
-        "results/ldsc_rg/{trait1}_{trait2}.log"
-    priority: 20
+        # LDSC writes {out}.log itself (buffered); stdout carries the same messages live
+        "results/ldsc_rg/{trait1}__{trait2}.log"
+    log:
+        "results/ldsc_rg/stdout/{trait1}__{trait2}.log"
     params:
-        out_prefix="results/ldsc_rg/{trait1}_{trait2}",
-        ld_ref=config.get("ld_ref", "data/reference/LDscores"),
-        env_setup=lambda wildcards: get_env_setup("ldsc_env"),
-        python_bin=get_python_bin(),
-        ldsc_script=config.get("ldsc_script", "../ldsc/ldsc.py"),
-        # Legacy parameter compatibility
-        time="02:00:00",
-        partition=config.get("slurm_partition", "irbio01")
-    resources:
-        mem_mb=16000,
-        cpus=1,
-        runtime=120,
-        slurm_partition=config.get("slurm_partition", "irbio01"),
-        slurm_extra="'--output=logs/ldsc_rg_%j.out --error=logs/ldsc_rg_%j.err'"
+        out_prefix="results/ldsc_rg/{trait1}__{trait2}",
+        ld_ref=LDSC.get("ld_ref_chr", "data/reference/LDscores/"),
+        w_ld=LDSC.get("w_ld_chr", "data/reference/LDscores/")
     shell:
         """
-        {params.env_setup}{params.python_bin} {params.ldsc_script} \
-            --rg {input.trait1},{input.trait2} \
-            --ref-ld-chr {params.ld_ref}/ \
-            --w-ld-chr {params.ld_ref}/ \
-            --out {params.out_prefix}
+        {PYTHON} -u {input.script}             --rg {input.sumstats1},{input.sumstats2}             --ref-ld-chr {params.ld_ref}             --w-ld-chr {params.w_ld}             --out {params.out_prefix}             > {log} 2>&1
+        """
+
+def rg_summary_inputs(wildcards):
+    if not RG_PAIRS:
+        raise ValueError(
+            "No genetic correlation pairs: set config rg.traits (>= 2 traits, or rg.target plus >= 1 trait)."
+        )
+    return [f"results/ldsc_rg/{pair_stem(*pair)}.log" for pair in RG_PAIRS]
+
+rule rg_summary:
+    input:
+        rg_summary_inputs
+    output:
+        "results/ldsc_rg/rg_summary.tsv"
+    shell:
+        """
+        {PYTHON} scripts/ldsc_rg_summary.py --logs {input} --alpha {FDR_ALPHA} --output {output}
         """
 
 # ------------------------------------------------------------------------------
-# Step 3: Plot Heatmap for Genetic Correlations
+# Step A1: DNA ASM Tag SNP Overlap with GWAS + BH FDR, then LD-Proxy Expansion (Per-Trait)
 # ------------------------------------------------------------------------------
-rule plot_heatmap:
+rule overlap_dna_asm:
     input:
-        # Require every single correlation log to be finished before plotting
-        logs=expand("results/ldsc_rg/{pair}.log", pair=PAIRS)
+        gwas=lambda wildcards: GWAS_FILES[wildcards.trait],
+        mapping_table=config["dna"]["mapping_table"]
     output:
-        "results/figures/rg_heatmap.pdf"
+        all="results/dna/{trait}_overlap_all.tsv",
+        sig="results/dna/{trait}_overlap_sig.tsv"
     params:
-        env_setup=lambda wildcards: get_env_setup("snakemake_env"),
-        python_bin=get_python_bin(),
-        # Legacy parameter compatibility
-        time="00:30:00",
-        partition=config.get("slurm_partition", "irbio01")
-    resources:
-        mem_mb=4000,
-        cpus=1,
-        runtime=30,
-        slurm_partition=config.get("slurm_partition", "irbio01"),
-        slurm_extra="'--output=logs/plot_heatmap_%j.out --error=logs/plot_heatmap_%j.err'"
+        alpha=FDR_ALPHA,
+        tag_fallback=config["dna"].get("tag_fallback", "none")
     shell:
         """
-        {params.env_setup}{params.python_bin} scripts/plot_heatmap.py {input.logs} {output}
+        {PYTHON} scripts/overlap_dna_asm.py \
+            --mapping-table {input.mapping_table} \
+            --gwas {input.gwas} \
+            --trait {wildcards.trait} \
+            --alpha {params.alpha} \
+            --tag-fallback {params.tag_fallback} \
+            --output-all {output.all} \
+            --output-sig {output.sig}
         """
 
 # ------------------------------------------------------------------------------
-# Step 4: Plot Network for Genetic Correlations
+# Step A2: Map BH-Significant CpGs to GENCODE v19 Gene TSS (< 5 kb, Per-Trait)
 # ------------------------------------------------------------------------------
-rule plot_network:
+rule map_cpg_to_tss_genes:
     input:
-        logs=expand("results/ldsc_rg/{pair}.log", pair=PAIRS)
+        overlap="results/dna/{trait}_overlap_sig.tsv",
+        cpg_coordinates=config["dna"]["cpg_coordinates"],
+        gene_tss=config["dna"]["gene_tss"]
     output:
-        "results/figures/rg_network.pdf"
+        "results/dna/{trait}_cpg_tss.tsv"
     params:
-        env_setup=lambda wildcards: get_env_setup("snakemake_env"),
-        python_bin=get_python_bin(),
-        # Legacy parameter compatibility
-        time="00:30:00",
-        partition=config.get("slurm_partition", "irbio01")
-    resources:
-        mem_mb=4000,
-        cpus=1,
-        runtime=30,
-        slurm_partition=config.get("slurm_partition", "irbio01"),
-        slurm_extra="'--output=logs/plot_network_%j.out --error=logs/plot_network_%j.err'"
+        cutoff=config["dna"].get("tss_distance_cutoff", 5000)
     shell:
         """
-        {params.env_setup}{params.python_bin} scripts/plot_genetic_correlations.py {input.logs} {output}
+        {PYTHON} scripts/map_cpg_tss.py \
+            --overlap {input.overlap} \
+            --cpg-coords {input.cpg_coordinates} \
+            --gene-tss {input.gene_tss} \
+            --cutoff {params.cutoff} \
+            --output {output}
         """
 
 # ------------------------------------------------------------------------------
-# Step 5: Methylation analysis, overlap DNA & RNA SNP lists with GWAS
+# Step A3: Query GTEx v10 Brain eQTLs (13 Tissues) for BH-Significant SNPs (Per-Trait)
 # ------------------------------------------------------------------------------
-rule methylation_overlap:
+rule lookup_gtex_brain_eqtls:
     input:
-        gwas="data/raw_data/{trait}_gwas.txt",
-        snp_list="data/methylation/{meth}_SNPlist.txt"
+        overlap="results/dna/{trait}_overlap_sig.tsv"
     output:
-        overlap_ids="results/methylation/{meth}_{trait}_overlap.txt",
-        overlap_full="results/methylation/{meth}_{trait}_overlap_fullheaders.txt"
+        "results/dna/{trait}_gtex_brain_eqtls.tsv"
     params:
-        env_setup=lambda wildcards: get_env_setup("snakemake_env"),
-        python_bin=get_python_bin(),
-        # Legacy parameter compatibility
-        partition=config.get("slurm_partition", "irbio01"),
-        time="00:15:00"
-    resources:
-        mem_mb=4000,
-        cpus=1,
-        runtime=15,
-        slurm_partition=config.get("slurm_partition", "irbio01"),
-        slurm_extra="'--output=logs/methylation_overlap_%j.out --error=logs/methylation_overlap_%j.err'"
+        tissues=" ".join(config["gtex"]["brain_tissues"]),
+        p_threshold=config["gtex"].get("p_threshold", 0.05),
+        cache_file=config["gtex"].get("cache_file", "results/.cache/gtex_eqtl_cache.json")
     shell:
         """
-        {params.env_setup}{params.python_bin} scripts/overlap_methylation.py {input.snp_list} {input.gwas} {output.overlap_full} {output.overlap_ids}
+        {PYTHON} scripts/lookup_gtex_brain_eqtls.py \
+            --overlap {input.overlap} \
+            --output {output} \
+            --tissues {params.tissues} \
+            --p-threshold {params.p_threshold} \
+            --cache-file {params.cache_file}
+        """
+
+# ------------------------------------------------------------------------------
+# Step A4: CpG-Proximal Gene vs. GTEx Brain eQTL Target Gene Concordance (Per-Trait)
+# ------------------------------------------------------------------------------
+rule compare_tss_and_gtex_genes:
+    input:
+        tss="results/dna/{trait}_cpg_tss.tsv",
+        gtex="results/dna/{trait}_gtex_brain_eqtls.tsv"
+    output:
+        "results/dna/{trait}_concordance.tsv"
+    shell:
+        """
+        {PYTHON} scripts/compare_tss_gtex.py \
+            --tss {input.tss} \
+            --gtex {input.gtex} \
+            --trait {wildcards.trait} \
+            --output {output}
+        """
+
+# ------------------------------------------------------------------------------
+# Step A5: Cross-Trait DNA Methylation Pleiotropy Summary
+# ------------------------------------------------------------------------------
+rule pleiotropy_dna:
+    input:
+        expand("results/dna/{trait}_concordance.tsv", trait=TRAITS)
+    output:
+        "results/dna/pleiotropy_dna.tsv"
+    shell:
+        """
+        {PYTHON} scripts/pleiotropy.py --mode dna --inputs {input} --output {output}
+        """
+
+# ------------------------------------------------------------------------------
+# Step B1: Overlap RNA m6A SNP List with GWAS + BH FDR (Per-Trait)
+# ------------------------------------------------------------------------------
+rule overlap_rna_m6a:
+    input:
+        gwas=lambda wildcards: GWAS_FILES[wildcards.trait],
+        snp_list=config["rna"]["snp_list"]
+    output:
+        "results/rna/{trait}_overlap_bh.tsv"
+    params:
+        alpha=FDR_ALPHA
+    shell:
+        """
+        {PYTHON} scripts/overlap_rna_m6a.py \
+            --snp-list {input.snp_list} \
+            --gwas {input.gwas} \
+            --trait {wildcards.trait} \
+            --alpha {params.alpha} \
+            --output {output}
+        """
+
+# ------------------------------------------------------------------------------
+# Step B2: Ensembl Genes Overlapping the BH-Significant RNA m6A SNPs (All Traits)
+# ------------------------------------------------------------------------------
+rule annotate_rna_genes:
+    input:
+        expand("results/rna/{trait}_overlap_bh.tsv", trait=TRAITS)
+    output:
+        "results/rna/rna_sig_genes.tsv"
+    params:
+        server=config["rna"].get("ensembl_server", "https://grch37.rest.ensembl.org"),
+        cache_file=config["rna"].get("ensembl_cache_file", "results/.cache/ensembl_grch37_genes_cache.json")
+    shell:
+        """
+        {PYTHON} scripts/annotate_rna_genes.py \
+            --inputs {input} \
+            --output {output} \
+            --server {params.server} \
+            --cache-file {params.cache_file}
+        """
+
+# ------------------------------------------------------------------------------
+# Step B3: Cross-Trait RNA Methylation Pleiotropy Summary
+# ------------------------------------------------------------------------------
+rule pleiotropy_rna:
+    input:
+        overlaps=expand("results/rna/{trait}_overlap_bh.tsv", trait=TRAITS),
+        genes="results/rna/rna_sig_genes.tsv"
+    output:
+        "results/rna/pleiotropy_rna.tsv"
+    shell:
+        """
+        {PYTHON} scripts/pleiotropy.py --mode rna --inputs {input.overlaps} --genes {input.genes} --output {output}
         """

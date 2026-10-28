@@ -1,5 +1,5 @@
 # ==============================================================================
-# Snakemake 9 HPC Environment Specification
+# Snakemake 9 HPC & Local Environment Specification (Pipeline + Streamlit App)
 # Create environment with:
 #   conda env create -f envs/snakemake9.yaml
 #   conda activate snakemake9_env
@@ -12,16 +12,15 @@ channels:
 dependencies:
   - python >=3.10,<3.13
   - snakemake >=9.0
-  - snakemake-executor-plugin-slurm
+  - snakemake-executor-plugin-slurm >=2.0
   - pandas >=2.0
   - numpy >=1.24
+  # LDSC munge_sumstats.py (../ldsc, Python 3 patched; see patches/ldsc_python3.patch)
   - scipy >=1.10
-  - statsmodels >=0.14
-  - networkx >=3.0
-  - matplotlib >=3.7
-  - seaborn >=0.12
-  - requests >=2.30
-  - pyyaml >=6.0
-  - plotly >=5.18
-  - streamlit >=1.38
   - bitarray >=2.0
+  - requests >=2.30
+  - urllib3 >=2.0
+  - pyyaml >=6.0
+  - openpyxl >=3.1
+  - streamlit >=1.46
+  - plotly >=5.0
