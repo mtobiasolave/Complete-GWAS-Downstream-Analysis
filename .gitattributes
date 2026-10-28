@@ -1,0 +1,2 @@
+# Keep LF line endings in every checkout (Windows included): sbatch rejects DOS line breaks
+* text=auto eol=lf

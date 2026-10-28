@@ -789,7 +789,7 @@ with tab_munge:
     elif "usecols=list(cname_translation.keys())" not in munge_script.read_text(encoding="utf-8", errors="replace"):
         st.warning(
             "This LDSC copy looks unpatched for Python 3. Apply the bundled fixes with "
-            "`git -C ../ldsc apply patches/ldsc_python3.patch`."
+            "`git -C ../ldsc apply \"$PWD/patches/ldsc_python3.patch\"` (run from the repository root)."
         )
 
     include_munged = st.checkbox("Include already munged traits (re-munge)", key="munge_include_done")
