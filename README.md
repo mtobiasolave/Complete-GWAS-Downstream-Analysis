@@ -84,9 +84,17 @@ All paths are relative to the repository root, so the folder can be moved betwee
 ## Installation
 
 ```bash
-conda env create -f envs/snakemake9.yaml
+git clone git@github.com:mtobiasolave/Complete-GWAS-Downstream-Analysis.git
+cd Complete-GWAS-Downstream-Analysis
+
+# Strict channel priority keeps the Anaconda defaults channel out of the solve
+CONDA_CHANNEL_PRIORITY=strict conda env create -f envs/snakemake9.yaml
 conda activate snakemake9_env
+conda list | grep -c pkgs/main   # expect 0
 ```
+`envs/snakemake9.yaml` pins the versions the pipeline was tested with (Snakemake 9.24, pandas 3.0, Python 3.12). If `pkgs/main` packages still appear, create the environment with `conda create -n snakemake9_env --override-channels -c conda-forge -c bioconda --strict-channel-priority` and the package list from the YAML.
+
+The `munge` and `rg` targets also need the sibling LDSC repository (see [LDSC requirements](#ldsc-requirements)) and `data/reference/w_hm3.snplist` plus `data/reference/LDscores/` (git-ignored; copy them separately).
 
 ---
 
@@ -128,11 +136,13 @@ sbatch scripts/run_pipeline.sbatch all SUD2023,BipolarDisorder2024
 ```
 
 ### LDSC requirements
-Munging runs `../ldsc/munge_sumstats.py` with the `snakemake9_env` interpreter (validated with pandas 3: Z, alleles and N match the raw sumstats). The sibling LDSC copy must contain the Python 3 fixes; if the app warns that it is unpatched (e.g. a fresh clone on the HPC):
+Munging runs `../ldsc/munge_sumstats.py` with the `snakemake9_env` interpreter (validated with pandas 3: Z, alleles and N match the raw sumstats). The sibling LDSC copy must contain the Python 3 fixes; on a fresh machine, from the repository root:
 ```bash
+git clone https://github.com/CBIIT/ldsc.git ../ldsc
 git -C ../ldsc checkout 6c67395      # CBIIT/ldsc base commit the patch applies to
-git -C ../ldsc apply --check patches/ldsc_python3.patch && git -C ../ldsc apply patches/ldsc_python3.patch
+git -C ../ldsc apply --check "$PWD/patches/ldsc_python3.patch" && git -C ../ldsc apply "$PWD/patches/ldsc_python3.patch"
 ```
+(`git -C` resolves relative paths from `../ldsc`, hence `$PWD`.)
 
 ### Notes
 - Step A3 queries the GTEx Portal API and needs outbound internet access on the node that runs it. Results are cached in `results/.cache/gtex_eqtl_cache.json`; failed requests are not cached and make the job fail so it can be retried.

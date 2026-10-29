@@ -1,8 +1,9 @@
 # ==============================================================================
 # Snakemake 9 HPC & Local Environment Specification (Pipeline + Streamlit App)
-# Create environment with:
-#   conda env create -f envs/snakemake9.yaml
+# Create environment with (strict priority keeps the Anaconda defaults channel out):
+#   CONDA_CHANNEL_PRIORITY=strict conda env create -f envs/snakemake9.yaml
 #   conda activate snakemake9_env
+# Versions are pinned to the tested environment (no build strings: linux-64, osx and win-64).
 # ==============================================================================
 name: snakemake9_env
 channels:
@@ -10,17 +11,17 @@ channels:
   - bioconda
   - nodefaults
 dependencies:
-  - python >=3.10,<3.13
-  - snakemake >=9.0
-  - snakemake-executor-plugin-slurm >=2.0
-  - pandas >=2.0
-  - numpy >=1.24
+  - python =3.12
+  - snakemake =9.24.0
+  - snakemake-executor-plugin-slurm =2.8.0
+  - pandas =3.0.6
+  - numpy =2.5.4
   # LDSC munge_sumstats.py (../ldsc, Python 3 patched; see patches/ldsc_python3.patch)
-  - scipy >=1.10
-  - bitarray >=2.0
-  - requests >=2.30
-  - urllib3 >=2.0
-  - pyyaml >=6.0
-  - openpyxl >=3.1
-  - streamlit >=1.46
-  - plotly >=5.0
+  - scipy =1.18.1
+  - bitarray =3.12
+  - requests =2.34.2
+  - urllib3 =2.8.0
+  - pyyaml =6.0.3
+  - openpyxl =3.1.5
+  - streamlit =1.66
+  - plotly =7.1.0
