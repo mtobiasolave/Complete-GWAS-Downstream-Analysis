@@ -318,12 +318,13 @@ def load_multiomics(dna_mtime: float, rna_mtime: float) -> pd.DataFrame:
         on="SNP",
         suffixes=("_DNA", "_RNA"),
     )
-    merged["TRAITS_DNA"] = merged["TRAIT_LIST_DNA"].str.join(", ")
-    merged["TRAITS_RNA"] = merged["TRAIT_LIST_RNA"].str.join(", ")
+    # Plain joins, not .str.join: a column built from an empty list (no shared SNPs) is float64
+    merged["TRAITS_DNA"] = [", ".join(t) for t in merged["TRAIT_LIST_DNA"]]
+    merged["TRAITS_RNA"] = [", ".join(t) for t in merged["TRAIT_LIST_RNA"]]
     merged["TRAIT_LIST"] = [
         sorted(set(d) | set(r)) for d, r in zip(merged["TRAIT_LIST_DNA"], merged["TRAIT_LIST_RNA"])
     ]
-    merged["TRAITS_PRESENT"] = merged["TRAIT_LIST"].str.join(", ")
+    merged["TRAITS_PRESENT"] = [", ".join(t) for t in merged["TRAIT_LIST"]]
     return merged.drop(columns=["TRAIT_LIST_DNA", "TRAIT_LIST_RNA"])
 
 
