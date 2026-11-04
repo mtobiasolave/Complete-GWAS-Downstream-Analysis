@@ -404,7 +404,7 @@ MUNGE_ALIASES: Dict[str, List[str]] = {
     "--snp": ["SNP", "snp", "rsID", "rsid", "ID"],
     "--a1": ["A1", "a1", "Allele1", "effect_allele", "alt", "Aallele"],
     "--a2": ["A2", "a2", "Allele2", "other_allele", "ref", "Ballele"],
-    "--p": ["P", "p", "pvalue", "p_value", "P_value", "P.value", "P-value"],
+    "--p": ["P", "p", "pvalue", "p_value", "P_value", "P.value", "P-value", "PVAL"],
 }
 MUNGE_N_ALIASES: List[str] = ["N", "n", "N_eff", "Neff", "N_EFF", "N_TOTAL", "Weight", "weight", "NTotal"]
 
