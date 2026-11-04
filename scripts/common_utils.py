@@ -401,12 +401,12 @@ def save_json_cache(cache_path: Optional[str], cache_data: dict) -> None:
 # =====================================================================
 
 MUNGE_ALIASES: Dict[str, List[str]] = {
-    "--snp": ["SNP", "snp", "rsID", "rsid"],
+    "--snp": ["SNP", "snp", "rsID", "rsid", "ID"],
     "--a1": ["A1", "a1", "Allele1", "effect_allele", "alt", "Aallele"],
     "--a2": ["A2", "a2", "Allele2", "other_allele", "ref", "Ballele"],
-    "--p": ["P", "p", "pvalue", "p_value", "P_value", "P.value"],
+    "--p": ["P", "p", "pvalue", "p_value", "P_value", "P.value", "P-value"],
 }
-MUNGE_N_ALIASES: List[str] = ["N", "n", "N_eff", "Neff", "N_EFF", "N_TOTAL", "Weight"]
+MUNGE_N_ALIASES: List[str] = ["N", "n", "N_eff", "Neff", "N_EFF", "N_TOTAL", "Weight", "weight", "NTotal"]
 
 
 def read_gwas_header(gwas_path: Union[str, Path]) -> List[str]:
