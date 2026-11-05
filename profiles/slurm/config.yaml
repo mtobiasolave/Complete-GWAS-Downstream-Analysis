@@ -42,3 +42,7 @@ set-resources:
   ldsc_rg:
     runtime: 60
     mem_mb: 8000
+  # Single-trait LD Score regression: same LD-score loading as rg, one regression (~15 s locally)
+  ldsc_h2:
+    runtime: 30
+    mem_mb: 8000

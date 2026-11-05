@@ -9,10 +9,13 @@
 #   munge : LDSC munge_sumstats.py -> results/munged/{trait}.sumstats.gz
 #   rg    : LDSC genetic correlation for the pairs in config `rg`
 #           -> results/ldsc_rg/{trait1}__{trait2}.log + results/ldsc_rg/rg_summary.tsv
+#   h2    : LDSC SNP heritability for the traits in config `h2` (observed or liability scale)
+#           -> results/ldsc_h2/{h2_trait}.log + results/ldsc_h2/h2_summary.tsv
 #
 # Local:  snakemake --cores 2 all [--config traits=TraitA,TraitB]
 # Slurm:  snakemake --profile profiles/slurm all
 # rg:     snakemake --cores 2 rg --config traits=A,B,C 'rg={"traits": ["A", "B", "C"], "target": ""}'
+# h2:     snakemake --cores 2 h2 --config traits=A,B 'h2={"traits": ["A", "B"], "prevalence": {"A": {"pop_prev": 0.01, "samp_prev": 0.5}}}'
 # ==============================================================================
 
 import re
@@ -25,6 +28,7 @@ workdir: workflow.basedir
 sys.path.insert(0, str(Path(workflow.basedir) / "scripts"))
 from common_utils import discover_gwas, munge_column_flags, read_gwas_header
 from ldsc_rg_summary import pair_stem, rg_pairs
+from ldsc_h2_summary import h2_flags
 
 # Load configuration file (merges local overrides if config_local.yaml exists)
 configfile: "config.yaml"
@@ -63,14 +67,20 @@ if MISSING_TRAITS:
 RG = config.get("rg") or {}
 RG_PAIRS = rg_pairs(RG.get("traits") or [], RG.get("target") or None)
 
+# 4. SNP heritability traits: config h2.traits, with per-trait prevalences (liability scale)
+#    and an optional fixed intercept; flags are validated when the DAG is built
+H2 = config.get("h2") or {}
+H2_TRAITS = sorted({str(t).strip() for t in (H2.get("traits") or []) if str(t).strip()})
+
 wildcard_constraints:
     trait="|".join(re.escape(t) for t in TRAITS) or "[^/]+",
     # Pair outputs are {trait1}__{trait2}; trait names must not contain "__"
     trait1="(?:(?!__)[^/])+",
-    trait2="(?:(?!__)[^/])+"
+    trait2="(?:(?!__)[^/])+",
+    h2_trait="[^/]+"
 # -----                ----- #
 
-localrules: all, dna, rna, munge, rg, rg_summary, pleiotropy_dna, pleiotropy_rna
+localrules: all, dna, rna, munge, rg, rg_summary, h2, h2_summary, pleiotropy_dna, pleiotropy_rna
 
 # ==========================================
 # PIPELINE TARGETS
@@ -96,6 +106,10 @@ rule munge:
 rule rg:
     input:
         "results/ldsc_rg/rg_summary.tsv"
+
+rule h2:
+    input:
+        "results/ldsc_h2/h2_summary.tsv"
 
 # ------------------------------------------------------------------------------
 # Munge GWAS Summary Statistics with LDSC munge_sumstats.py (Per-Trait)
@@ -167,6 +181,51 @@ rule rg_summary:
     shell:
         """
         {PYTHON} scripts/ldsc_rg_summary.py --logs {input} --alpha {FDR_ALPHA} --output {output}
+        """
+
+# ------------------------------------------------------------------------------
+# SNP Heritability (h2) with LDSC ldsc.py --h2 (Per Trait)
+# ------------------------------------------------------------------------------
+rule ldsc_h2:
+    input:
+        sumstats="results/munged/{h2_trait}.sumstats.gz",
+        # ancient(): updating the LDSC repo must not force re-running every trait
+        script=ancient(LDSC.get("ldsc_script", "../ldsc/ldsc.py"))
+    output:
+        # LDSC writes {out}.log itself (buffered); stdout carries the same messages live
+        "results/ldsc_h2/{h2_trait}.log"
+    log:
+        "results/ldsc_h2/stdout/{h2_trait}.log"
+    params:
+        out_prefix="results/ldsc_h2/{h2_trait}",
+        ld_ref=LDSC.get("ld_ref_chr", "data/reference/LDscores/"),
+        w_ld=LDSC.get("w_ld_chr", "data/reference/LDscores/"),
+        # --samp-prev/--pop-prev only for the liability scale; --intercept-h2 only if fixed
+        extra=lambda wildcards: " ".join(h2_flags(wildcards.h2_trait, H2))
+    shell:
+        """
+        {PYTHON} -u {input.script} \
+            --h2 {input.sumstats} \
+            --ref-ld-chr {params.ld_ref} \
+            --w-ld-chr {params.w_ld} \
+            {params.extra} \
+            --out {params.out_prefix} \
+            > {log} 2>&1
+        """
+
+def h2_summary_inputs(wildcards):
+    if not H2_TRAITS:
+        raise ValueError("No heritability traits: set config h2.traits (>= 1 trait).")
+    return [f"results/ldsc_h2/{trait}.log" for trait in H2_TRAITS]
+
+rule h2_summary:
+    input:
+        h2_summary_inputs
+    output:
+        "results/ldsc_h2/h2_summary.tsv"
+    shell:
+        """
+        {PYTHON} scripts/ldsc_h2_summary.py --logs {input} --output {output}
         """
 
 # ------------------------------------------------------------------------------

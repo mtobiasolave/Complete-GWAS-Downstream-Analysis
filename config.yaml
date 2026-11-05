@@ -27,6 +27,22 @@ ldsc:
     SUD2023: 1025550
   n_col_override: {}
 
+# SNP Heritability (target `h2`): ldsc.py --h2 with the LD scores above (ldsc.ld_ref_chr / w_ld_chr)
+# Output: results/ldsc_h2/{trait}.log + results/ldsc_h2/h2_summary.tsv
+h2:
+  # Traits to estimate (the app sets these per run; CLI: --config 'h2={"traits": [...]}')
+  traits: []
+  # Intercept: empty = free (LDSC default, two-step estimator at chi^2 30);
+  # a positive value is passed as --intercept-h2 (1 = classic constrained LD Score regression)
+  intercept_h2: ""
+  # Liability scale for case-control traits: both prevalences or neither, each strictly in (0, 1).
+  #   pop_prev  (--pop-prev):  population prevalence K of the disorder
+  #   samp_prev (--samp-prev): 0.5 if the trait was munged with an effective N (sum of effective
+  #                            sample sizes); otherwise the GWAS case fraction cases / (cases + controls)
+  # Traits not listed are estimated on the observed scale. Example:
+  #   BipolarDisorder2024: {pop_prev: 0.01, samp_prev: 0.5}
+  prevalence: {}
+
 # Multiple-Testing Correction
 # Benjamini-Hochberg FDR level, applied per trait: DNA across tag SNPs (one test per tag),
 # RNA across the reference SNPs found in its GWAS

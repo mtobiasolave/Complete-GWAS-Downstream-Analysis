@@ -40,7 +40,7 @@ def build_command(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Launch the methylation Snakemake pipeline.")
-    parser.add_argument("--target", choices=["all", "dna", "rna", "munge", "rg"], default="all", help="Snakemake target rule")
+    parser.add_argument("--target", choices=["all", "dna", "rna", "munge", "rg", "h2"], default="all", help="Snakemake target rule")
     parser.add_argument("--traits", default="", help="Comma-separated trait names (default: config)")
     parser.add_argument("--engine", choices=["local", "slurm"], default="local", help="Execution engine")
     parser.add_argument("--cores", type=int, default=2, help="Local cores (ignored for slurm)")

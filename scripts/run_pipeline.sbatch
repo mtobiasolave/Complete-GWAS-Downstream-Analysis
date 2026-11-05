@@ -11,8 +11,9 @@
 #   sbatch scripts/run_pipeline.sbatch [target] [traits] [status_file] [run_pipeline.py options]
 #   sbatch scripts/run_pipeline.sbatch all SUD2023,BipolarDisorder2024
 #   sbatch scripts/run_pipeline.sbatch munge SUD2023 "" --forcerun munge_sumstats
+#   sbatch scripts/run_pipeline.sbatch h2 SUD2023 "" --extra-config 'h2={"traits": ["SUD2023"]}'
 #
-# target: all | dna | rna | munge | rg (default: all); traits: comma-separated (default: config.yaml)
+# target: all | dna | rna | munge | rg | h2 (default: all); traits: comma-separated (default: config.yaml)
 # ==============================================================================
 #SBATCH --job-name=methyl_pipeline
 #SBATCH --partition=irbio01
