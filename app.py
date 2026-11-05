@@ -43,6 +43,16 @@ from ldsc_rg_summary import (  # noqa: E402
     parse_rg_log,
     rg_pairs,
 )
+from common_utils import bh_fdr  # noqa: E402
+from ldsc_h2_summary import (  # noqa: E402
+    H2_RESULT_COLUMNS,
+    H2_TABLE_COLUMNS,
+    logged_h2_settings,
+    munge_n_source,
+    parse_h2_log,
+    requested_h2_settings,
+    validate_prevalence,
+)
 
 RUNS_DIR = ROOT / "logs" / "runs"
 DNA_TABLE = ROOT / "results" / "dna" / "pleiotropy_dna.tsv"
@@ -61,6 +71,11 @@ RG_MODES = ["All-vs-All Matrix", "Target vs. Panel (Hub & Spokes)"]
 RG_COLORSCALE = [[0.0, "#184f95"], [0.25, "#6da7ec"], [0.5, "#f0efec"], [0.75, "#ec8f8e"], [1.0, "#a32c2b"]]
 RG_SIG_COLOR = "#2a78d6"
 RG_NS_COLOR = "#898781"
+H2_DIR = ROOT / "results" / "ldsc_h2"
+H2_STDOUT_DIR = H2_DIR / "stdout"
+H2_INTERCEPT_MODES = ["Free (LDSC default)", "Constrained to 1", "Fixed value"]
+H2_VIEW_MODES = ["Multi-Trait Comparison (Panel)", "Single Trait Deep-Dive (Target)"]
+H2_SORTS = ["h² (descending)", "Trait name", "Significance (Z)"]
 
 TARGET_MODES = {
     "Both (DNA + RNA)": "all",
@@ -626,7 +641,253 @@ def rg_monitor() -> None:
 
 
 # =====================================================================
-# 6. Sidebar: Execution & Configuration Panel
+# 6. SNP Heritability (LDSC ldsc.py --h2)
+# =====================================================================
+
+def h2_signature() -> tuple:
+    """Names and mtimes of results/ldsc_h2/{trait}.log files; keys the results cache."""
+    if not H2_DIR.is_dir():
+        return ()
+    return tuple((p.name, p.stat().st_mtime) for p in sorted(H2_DIR.glob("*.log")))
+
+
+@st.cache_data(show_spinner=False)
+def load_h2_results(signature: tuple) -> pd.DataFrame:
+    """Observed/liability h2, Z, P, intercept, ratio parsed from every trait's LDSC log."""
+    rows = [parse_h2_log(H2_DIR / name) for name, _ in signature]
+    return pd.DataFrame(rows, columns=H2_RESULT_COLUMNS)
+
+
+@st.cache_data(show_spinner=False)
+def load_h2_settings(signature: tuple) -> dict:
+    """{trait: settings} each existing log was computed with (prevalences, fixed intercept)."""
+    return {
+        Path(name).stem: logged_h2_settings((H2_DIR / name).read_text(encoding="utf-8", errors="replace"))
+        for name, _ in signature
+    }
+
+
+def same_h2_settings(logged: dict, requested: dict) -> bool:
+    for key in ("pop_prev", "samp_prev", "intercept_h2"):
+        a, b = logged.get(key), requested.get(key)
+        if (a is None) != (b is None) or (a is not None and not np.isclose(a, b)):
+            return False
+    return True
+
+
+def format_p(p: float) -> str:
+    if pd.isna(p):
+        return "NA"
+    return "< 1e-300" if p == 0 else f"{p:.2e}"
+
+
+def h2_run_traits(run: dict) -> list:
+    """Traits of an h2 run, from the `h2=` Snakemake config it was launched with."""
+    for item in run.get("extra_config", []):
+        if item.startswith("h2="):
+            return json.loads(item[len("h2="):]).get("traits") or []
+    return []
+
+
+def h2_trait_status(trait: str, run: dict, status: str) -> str:
+    """Per-trait state within an h2 run, from output/log mtimes relative to the run start."""
+    started = datetime.fromisoformat(run["started"]).timestamp()
+    output = H2_DIR / f"{trait}.log"
+    live_log = H2_STDOUT_DIR / f"{trait}.log"
+    if output.exists() and output.stat().st_mtime >= started:
+        return "✅ Done"
+    if live_log.exists() and live_log.stat().st_mtime >= started:
+        if status in ("running", "pending"):
+            return "⏳ Running"
+        return "⛔ Cancelled" if status == "cancelled" else "❌ Failed"
+    if output.exists() and not run.get("forcerun"):
+        return "✅ Done (already up to date)"
+    if status in ("running", "pending"):
+        return "🕒 Queued"
+    return "⛔ Cancelled" if status == "cancelled" else "❌ Failed"
+
+
+def h2_monitor() -> None:
+    """Status, per-trait progress and live LDSC log of the latest h2 run."""
+    run = latest_run()
+    if run is None or run["target"] != "h2":
+        st.caption("No heritability run in progress or recorded as the latest run.")
+        return
+
+    status = run_status(run)
+    traits = h2_run_traits(run)
+    states = [h2_trait_status(trait, run, status) for trait in traits]
+    n_done = sum(state.startswith("✅") for state in states)
+    box_state = "running" if status in ("running", "pending") else "complete" if status == "succeeded" else "error"
+    with st.status(
+        f"LDSC h2 run `{run['id']}` — {status} · {n_done} of {len(traits)} traits done",
+        state=box_state,
+        expanded=box_state != "complete",
+    ):
+        st.dataframe(pd.DataFrame({"Trait": traits, "Status": states}), hide_index=True)
+        if traits:
+            trait = st.selectbox("Log viewer", traits, key="h2_log_trait")
+            live_log = H2_STDOUT_DIR / f"{trait}.log"
+            log_path = live_log if live_log.exists() else H2_DIR / f"{trait}.log"
+            st.caption(f"`{log_path.relative_to(ROOT).as_posix()}`")
+            st.code(
+                "\n".join(read_log_tail(log_path).splitlines()[-60:]) or "(no log yet: trait is queued)",
+                language="log",
+                height=320,
+            )
+
+
+def h2_plot_frame(view: pd.DataFrame, scale: str, alpha: float) -> tuple:
+    """Plottable traits on `scale` with 95% CI and BH FDR across them, plus (trait, reason) exclusions."""
+    h2_col, se_col = ("h2 (liability)", "SE (liability)") if scale == "Liability" else ("h2 (observed)", "SE (observed)")
+    df = view.assign(h2=view[h2_col], SE=view[se_col])
+    excluded = []
+    for row in df.to_dict("records"):
+        if row["Scale"] == "":
+            excluded.append((row["Trait"], row["Note"] or "LDSC did not converge"))
+        elif pd.isna(row["h2"]):
+            excluded.append((row["Trait"], "no liability-scale estimate (run with both prevalences)"))
+        elif not row["SE"] > 0:
+            excluded.append((row["Trait"], f"invalid SE ({row['SE']})"))
+    ok = df[~df["Trait"].isin([t for t, _ in excluded])].copy()
+    ok["CI low"], ok["CI high"] = ok["h2"] - 1.96 * ok["SE"], ok["h2"] + 1.96 * ok["SE"]
+    ok["FDR"] = bh_fdr(ok["P-value"].to_numpy(dtype=float)) if not ok.empty else []
+    ok["Significant"] = ok["FDR"] < alpha
+    ok["Out of bounds"] = (ok["h2"] < 0) | (ok["h2"] > 1)
+    return ok, excluded
+
+
+def h2_forest(df: pd.DataFrame, scale: str, alpha: float, sort_by: str, ci: bool, highlight: str = None) -> go.Figure:
+    """h2 per trait with error bars (95% CI or ±1 SE), reference line at h2 = 0.
+
+    Panel view colors by BH FDR < alpha; with `highlight`, one trait is emphasized and the rest
+    grayed (context view). Out-of-bounds estimates (h2 < 0 or > 1) use an open diamond marker.
+    """
+    # Plotly draws the first category at the bottom, so each order is listed bottom -> top:
+    # largest h2 / Z on top, and Z..A so that A is on top
+    column, ascending = {
+        "h² (descending)": ("h2", True),
+        "Trait name": ("Trait", False),
+        "Significance (Z)": ("Z", True),
+    }[sort_by]
+    df = df.sort_values(column, ascending=ascending, key=(lambda s: s.str.lower()) if column == "Trait" else None)
+    categories = df["Trait"].tolist()
+    width = 1.96 if ci else 1.0
+    hover_data = df.assign(
+        intercept_txt=[
+            f"{i:.4f} (fixed)" if pd.isna(se) else f"{i:.4f} (SE {se:.4f})"
+            for i, se in zip(df["Intercept"], df["Intercept SE"])
+        ],
+        ratio_txt=[
+            f"{r:.4f} (SE {se:.4f})" if pd.notna(r) else (note.split("; ")[-1] if "Ratio" in note else "NA")
+            for r, se, note in zip(df["Ratio"], df["Ratio SE"], df["Note"])
+        ],
+        flag_txt=np.where(df["Out of bounds"], "<br>⚠ outside 0–1", ""),
+    )
+
+    if highlight:
+        groups = [
+            (hover_data["Trait"] != highlight, "Other traits", RG_NS_COLOR, 9),
+            (hover_data["Trait"] == highlight, highlight, RG_SIG_COLOR, 13),
+        ]
+    else:
+        groups = [
+            (~hover_data["Significant"], "Not significant", RG_NS_COLOR, 10),
+            (hover_data["Significant"], f"BH FDR < {alpha:g}", RG_SIG_COLOR, 10),
+        ]
+
+    fig = go.Figure()
+    for mask, name, color, size in groups:
+        part = hover_data[mask]
+        if part.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=part["h2"], y=part["Trait"], mode="markers", name=name,
+            marker=dict(
+                color=color, size=size, line=dict(width=2, color=color),
+                symbol=np.where(part["Out of bounds"], "diamond-open", "circle").tolist(),
+            ),
+            error_x=dict(type="data", array=width * part["SE"], color=color, thickness=2, width=4),
+            customdata=part[
+                ["SE", "CI low", "CI high", "Z", "P-value", "FDR", "intercept_txt", "ratio_txt", "flag_txt"]
+            ].to_numpy(),
+            hovertemplate=(
+                "<b>%{y}</b><br>h² = %{x:.4f} ± %{customdata[0]:.4f} (SE)"
+                "<br>95% CI %{customdata[1]:.4f} to %{customdata[2]:.4f}"
+                "<br>Z = %{customdata[3]:.2f} · P = %{customdata[4]:.2e} · FDR = %{customdata[5]:.2e}"
+                "<br>Intercept %{customdata[6]} · Ratio %{customdata[7]}%{customdata[8]}<extra></extra>"
+            ),
+        ))
+    if hover_data["Out of bounds"].any():
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers", name="Outside 0–1",
+            marker=dict(symbol="diamond-open", size=10, color=RG_NS_COLOR, line=dict(width=2, color=RG_NS_COLOR)),
+        ))
+    fig.add_vline(x=0, line_dash="dash", line_width=1, line_color=RG_NS_COLOR)
+    fig.update_yaxes(categoryorder="array", categoryarray=categories, title=None)
+    fig.update_xaxes(title=f"SNP heritability, {scale.lower()} scale (h², {'95% CI' if ci else '± 1 SE'})")
+    fig.update_layout(
+        height=min(180 + 30 * len(df), 1400),
+        margin=dict(t=40, l=10, r=10, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+    return fig
+
+
+def h2_ldsc_checks(rec: pd.Series, scale: str) -> pd.DataFrame:
+    """Data-quality checks for one trait, benchmarks quoted from the LDSC wiki (FAQ; Heritability and rg)."""
+    rows = []
+
+    def add(check, value, benchmark, ok, problem=""):
+        # ok may be a numpy.bool_ (from pandas comparisons): test truthiness, not identity with True
+        if ok is None:
+            status = "ℹ️ Info"
+        elif bool(ok):
+            status = "✅ Pass"
+        else:
+            status = f"⚠️ Check{': ' + problem if problem else ''}"
+        rows.append({"Check": check, "Value": value, "LDSC benchmark": benchmark, "Status": status})
+
+    mean_chi2 = rec["Mean chi2"]
+    add("Mean χ²", f"{mean_chi2:.4f}", "≥ 1.02 (below: data probably not suitable for LDSC)",
+        mean_chi2 >= 1.02 if pd.notna(mean_chi2) else False, "too little polygenic signal")
+
+    intercept, intercept_se = rec["Intercept"], rec["Intercept SE"]
+    if pd.isna(intercept_se):
+        add("Intercept", f"{intercept:.4f} (fixed)", "≈ 1; lower if the GWAS was GC-corrected", None)
+    else:
+        low, high = intercept - 1.96 * intercept_se, intercept + 1.96 * intercept_se
+        problem = "above 1: part of the χ² inflation is not polygenic" if low > 1 else (
+            "below 1: consistent with GC correction (h² biased downwards)" if high < 1 else "")
+        add("Intercept", f"{intercept:.4f} (SE {intercept_se:.4f})", "≈ 1; lower if the GWAS was GC-corrected",
+            low <= 1 <= high, problem)
+
+    if pd.notna(rec["Ratio"]):
+        add("Ratio", f"{rec['Ratio']:.4f} (SE {rec['Ratio SE']:.4f})", "≈ 0; 10–20% not uncommon",
+            rec["Ratio"] <= 0.2, "> 20% of the inflation attributed to non-polygenic causes")
+    elif "Ratio < 0" in rec["Note"]:
+        add("Ratio", "< 0", "≈ 0; 10–20% not uncommon", False, "usually indicates GC correction (h² biased downwards)")
+    else:
+        add("Ratio", "NA", "≈ 0; 10–20% not uncommon", None)
+
+    snps = rec["SNPs"]
+    add("Regression SNPs", f"{int(snps):,}" if pd.notna(snps) else "NA", "≥ 200,000 (fewer usually means a merge problem)",
+        snps >= 200_000 if pd.notna(snps) else False)
+
+    h2_value = rec["h2"]
+    if h2_value < 0:
+        problem = "negative: usually true h² near 0 plus sampling error"
+    elif h2_value > 1:
+        problem = ("above 1 on the liability scale: check N and the .M_5_50 files" if scale == "Liability"
+                   else "above 1: possible for an ascertained rare disease on the observed scale; check N")
+    else:
+        problem = ""
+    add(f"h² bounds ({scale.lower()})", f"{h2_value:.4f}", "0 ≤ h² ≤ 1", 0 <= h2_value <= 1, problem)
+    return pd.DataFrame(rows)
+
+
+# =====================================================================
+# 7. Sidebar: Execution & Configuration Panel
 # =====================================================================
 
 config = load_config()
@@ -680,7 +941,7 @@ with st.sidebar:
 
 
 # =====================================================================
-# 7. Main Area: Run Monitor & Interactive Results
+# 8. Main Area: Run Monitor & Interactive Results
 # =====================================================================
 
 st.title("🧬 Methylation × GWAS Pleiotropy Explorer")
@@ -691,8 +952,15 @@ st.caption(
 
 st.fragment(run_monitor, run_every=3 if run_active else None)()
 
-tab_dna, tab_rna, tab_multi, tab_munge, tab_rg = st.tabs(
-    ["🧬 DNA Methylation", "🔬 RNA Methylation", "🔗 Multi-Omics Overlap", "🧹 Munge Sumstats", "📊 Genetic Correlation"]
+tab_dna, tab_rna, tab_multi, tab_munge, tab_rg, tab_h2 = st.tabs(
+    [
+        "🧬 DNA Methylation",
+        "🔬 RNA Methylation",
+        "🔗 Multi-Omics Overlap",
+        "🧹 Munge Sumstats",
+        "📊 Genetic Correlation",
+        "🌱 Heritability (h²)",
+    ]
 )
 
 with tab_dna:
@@ -1084,3 +1352,340 @@ with tab_rg:
                 mime="text/tab-separated-values",
                 key="rg_download",
             )
+
+with tab_h2:
+    ldsc_cfg = config.get("ldsc") or {}
+    h2_defaults = config.get("h2") or {}
+    h2_script_rel = ldsc_cfg.get("ldsc_script", "../ldsc/ldsc.py")
+    h2_ld_ref = ldsc_cfg.get("ld_ref_chr", "data/reference/LDscores/")
+    h2_w_ld = ldsc_cfg.get("w_ld_chr", "data/reference/LDscores/")
+    h2_script_ok = (ROOT / h2_script_rel).is_file()
+    h2_ld_ok = all(any((ROOT / d).glob("*.l2.ldscore.gz")) for d in {h2_ld_ref, h2_w_ld})
+    st.caption(
+        "Univariate SNP heritability with LDSC `ldsc.py --h2` on munged summary statistics, one run per "
+        "trait (`results/ldsc_h2/{trait}.log`). Case-control traits can be reported on the liability scale. "
+        "Runs with the execution engine selected in the sidebar."
+    )
+    if not h2_script_ok:
+        st.error(f"LDSC script not found: `{h2_script_rel}` (config `ldsc.ldsc_script`).")
+    if not h2_ld_ok:
+        st.error(f"No LD scores (`*.l2.ldscore.gz`) in `{h2_ld_ref}` / `{h2_w_ld}` (config `ldsc.ld_ref_chr` / `ldsc.w_ld_chr`).")
+
+    h2_inventory = munged_inventory(munged_signature())
+    h2_traits = []
+    h2_problems = {}
+    if h2_inventory.empty:
+        st.info("No munged sumstats in `results/munged/` yet. Munge traits in the **🧹 Munge Sumstats** tab first.")
+    else:
+        h2_choices = h2_inventory.loc[h2_inventory["Trait"].isin(gwas_files), "Trait"].tolist()
+        if "h2_traits" in st.session_state:
+            st.session_state["h2_traits"] = [t for t in st.session_state["h2_traits"] if t in h2_choices]
+        col_all, col_clear, _ = st.columns([1, 1, 4])
+        col_all.button(
+            "Select all", key="h2_select_all", width="stretch",
+            on_click=lambda: st.session_state.update(h2_traits=list(h2_choices)),
+        )
+        col_clear.button(
+            "Clear all", key="h2_clear_all", width="stretch",
+            on_click=lambda: st.session_state.update(h2_traits=[]),
+        )
+        h2_traits = st.multiselect(
+            "Traits", h2_choices, key="h2_traits", placeholder="Choose traits",
+            help="Munged traits whose raw GWAS file is still in the raw data folder.",
+        )
+
+        # ---- Liability scale: per-trait prevalences (co-dependent, strictly in (0, 1)) ----
+        liability = st.toggle("Liability scale (case-control traits)", key="h2_liability")
+        h2_prevalence = {t: {"pop_prev": "", "samp_prev": ""} for t in h2_traits}
+        if liability and h2_traits:
+            st.info(
+                "**Sample prevalence (`--samp-prev`)**: use **0.5** when the trait was munged with an "
+                "**effective N** (sum of effective sample sizes, e.g. `Neff`), as recommended by Grotzinger et al. "
+                "(2023, *Biological Psychiatry*). Otherwise use the GWAS case fraction, cases / (cases + controls). "
+                "**Population prevalence (`--pop-prev`)**: lifetime prevalence of the disorder. Leave both empty for "
+                "a trait to keep it on the observed scale."
+            )
+            n_sources = {t: munge_n_source(MUNGED_DIR / f"{t}.log") for t in h2_traits}
+            prevalence_defaults = h2_defaults.get("prevalence") or {}
+            prev_rows = []
+            for t in h2_traits:
+                default = prevalence_defaults.get(t) or {}
+                kind, detail = n_sources[t]
+                samp_default = default.get("samp_prev")
+                if samp_default in (None, "") and kind == "effective":
+                    samp_default = 0.5
+                prev_rows.append({
+                    "Trait": t,
+                    "N at munge": f"{detail} ({kind.replace('_', ' ')})",
+                    "Pop prev (K)": None if default.get("pop_prev") in (None, "") else float(default["pop_prev"]),
+                    "Samp prev (P)": None if samp_default in (None, "") else float(samp_default),
+                })
+            prev_edited = st.data_editor(
+                pd.DataFrame(prev_rows, columns=["Trait", "N at munge", "Pop prev (K)", "Samp prev (P)"]),
+                hide_index=True,
+                width="stretch",
+                disabled=["Trait", "N at munge"],
+                column_config={
+                    "Pop prev (K)": st.column_config.NumberColumn(
+                        min_value=0.0, max_value=1.0, step=0.0001, format="%.4f", help="--pop-prev, 0 < K < 1"
+                    ),
+                    "Samp prev (P)": st.column_config.NumberColumn(
+                        min_value=0.0, max_value=1.0, step=0.0001, format="%.4f", help="--samp-prev, 0 < P < 1"
+                    ),
+                },
+                key="h2_prev_editor_" + "_".join(h2_traits),
+            )
+            for row in prev_edited.to_dict("records"):
+                t = row["Trait"]
+                pop = None if pd.isna(row["Pop prev (K)"]) else float(row["Pop prev (K)"])
+                samp = None if pd.isna(row["Samp prev (P)"]) else float(row["Samp prev (P)"])
+                try:
+                    validate_prevalence(pop, samp)
+                except ValueError as exc:
+                    h2_problems[t] = str(exc)
+                    continue
+                h2_prevalence[t] = {"pop_prev": "" if pop is None else pop, "samp_prev": "" if samp is None else samp}
+                kind, detail = n_sources[t]
+                if samp == 0.5 and kind in ("total", "manual"):
+                    st.warning(
+                        f"**{t}** was munged with {detail} ({kind}); P = 0.5 is only appropriate with an effective N. "
+                        "Use the GWAS case fraction, or re-munge with an effective-N column."
+                    )
+                elif samp is not None and kind == "half_effective":
+                    st.warning(
+                        f"**{t}** was munged with a half effective N ({detail}); h² would be inflated about 2×. "
+                        "Re-munge with the full effective N."
+                    )
+                elif samp is not None and samp != 0.5 and kind == "effective":
+                    st.warning(f"**{t}** was munged with an effective N ({detail}); the recommended sample prevalence is 0.5.")
+            for t, message in h2_problems.items():
+                st.error(f"**{t}**: {message}")
+
+        # ---- Advanced options: LD reference (display) & intercept constraint ----
+        with st.expander("⚙️ Advanced options"):
+            st.markdown(f"**LD reference** · `--ref-ld-chr {h2_ld_ref}` · `--w-ld-chr {h2_w_ld}`")
+            st.caption("Set in `config.yaml` (`ldsc.ld_ref_chr` / `ldsc.w_ld_chr`); shared with the Genetic Correlation tab.")
+            intercept_default = h2_defaults.get("intercept_h2")
+            if intercept_default in (None, ""):
+                default_mode = 0
+            else:
+                default_mode = 1 if float(intercept_default) == 1.0 else 2
+            intercept_mode = st.radio(
+                "LD Score regression intercept", H2_INTERCEPT_MODES, index=default_mode, horizontal=True,
+                key="h2_intercept_mode",
+                help="Free: estimated (two-step estimator, χ² cutoff 30). Constrained to 1: assumes no confounding "
+                "or sample overlap (smaller SE, biased if inflation is not polygenic). Fixed value: --intercept-h2.",
+            )
+            h2_intercept = ""
+            if intercept_mode == H2_INTERCEPT_MODES[1]:
+                h2_intercept = 1.0
+            elif intercept_mode == H2_INTERCEPT_MODES[2]:
+                h2_intercept = st.number_input(
+                    "Intercept value (--intercept-h2)", min_value=0.0001,
+                    value=float(intercept_default) if default_mode == 2 else 1.0, step=0.01, format="%.4f",
+                    key="h2_intercept_value",
+                )
+
+        h2_run_cfg = {"traits": sorted(h2_traits), "intercept_h2": h2_intercept, "prevalence": h2_prevalence}
+        h2_logged = load_h2_settings(h2_signature())
+        h2_finished = set(load_h2_results(h2_signature()).query("Scale != ''")["Trait"])
+        h2_up_to_date = [
+            t for t in h2_traits
+            if t not in h2_problems and t in h2_finished
+            and same_h2_settings(h2_logged.get(t, {}), requested_h2_settings(t, h2_run_cfg))
+        ]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Traits selected", len(h2_traits))
+        m2.metric("Computed with these settings", len(h2_up_to_date))
+        m3.metric("To run", len(h2_traits) - len(h2_up_to_date))
+
+        rerun_h2 = st.checkbox("Re-run traits already computed with these settings", key="h2_rerun")
+        h2_blocked = (
+            run_active
+            or not h2_traits
+            or bool(h2_problems)
+            or not h2_script_ok
+            or not h2_ld_ok
+            or (engine == "slurm" and not has_sbatch)
+            or (len(h2_up_to_date) == len(h2_traits) and not rerun_h2)
+        )
+        if st.button("🌱 Run Heritability", type="primary", disabled=h2_blocked, key="h2_run"):
+            try:
+                start_run(
+                    "h2",
+                    sorted(h2_traits),
+                    engine,
+                    int(cores),
+                    extra_config=[f"h2={json.dumps(h2_run_cfg)}"],
+                    forcerun="ldsc_h2" if rerun_h2 else None,
+                )
+                st.rerun()
+            except (OSError, subprocess.CalledProcessError) as exc:
+                detail = getattr(exc, "stderr", "") or str(exc)
+                st.error(f"Could not start the heritability run: {detail}")
+        if run_active:
+            st.caption("Another run is in progress; heritability can start once it finishes.")
+        elif h2_traits and len(h2_up_to_date) == len(h2_traits) and not rerun_h2:
+            st.caption("Every selected trait is already computed with these settings; tick **Re-run** to recompute.")
+
+    h2_active = run_active and current_run["target"] == "h2"
+    st.fragment(h2_monitor, run_every=3 if h2_active else None)()
+
+    if not h2_inventory.empty:
+        st.divider()
+        st.subheader("📈 Results")
+        h2_results = load_h2_results(h2_signature())
+        h2_view = h2_results[h2_results["Trait"].isin(h2_traits)].sort_values("Trait")
+        fdr_alpha = float(config.get("fdr_alpha", 0.05))
+        if not h2_traits:
+            st.info("Select one or more traits above to display the heritability comparison.")
+        elif h2_view.empty:
+            st.info("No computed traits for this selection yet.")
+        else:
+            stale = [
+                t for t in h2_view["Trait"]
+                if t not in h2_problems
+                and not same_h2_settings(h2_logged.get(t, {}), requested_h2_settings(t, h2_run_cfg))
+            ]
+            if stale:
+                st.warning(
+                    f"Shown results for {', '.join(stale)} were computed with different settings "
+                    "(scale, prevalences or intercept) than selected above; run to update them."
+                )
+
+            # ---- View controls (persist while hidden, so switching views keeps choices) ----
+            col_view, col_scale = st.columns([3, 2])
+            view_mode = col_view.radio(
+                "View", H2_VIEW_MODES, horizontal=True, key="h2_view_mode", persist_state="page"
+            )
+            has_liability = h2_view["h2 (liability)"].notna().any()
+            if has_liability:
+                scale_label = col_scale.radio(
+                    "Scale", ["Observed scale (h²)", "Liability scale (h²_liab)"], horizontal=True,
+                    key="h2_scale", persist_state="page",
+                    help="Liability-scale values exist only for traits run with both prevalences.",
+                )
+                h2_scale = "Liability" if scale_label.startswith("Liability") else "Observed"
+            else:
+                h2_scale = "Observed"
+                col_scale.caption("Scale: observed (no trait in this selection was run on the liability scale).")
+
+            plot_df, excluded = h2_plot_frame(h2_view, h2_scale, fdr_alpha)
+            if excluded:
+                st.warning(
+                    "Not plotted: " + "; ".join(f"**{t}** ({reason})" for t, reason in excluded)
+                )
+            out_of_bounds = plot_df.loc[plot_df["Out of bounds"], "Trait"].tolist()
+            if out_of_bounds:
+                st.warning(
+                    f"h² outside 0–1 for {', '.join(out_of_bounds)} (open diamonds). Negative estimates usually mean "
+                    "a true h² near 0 plus sampling error; see the LDSC checks in the Target view."
+                )
+
+            if view_mode == H2_VIEW_MODES[0]:
+                # ---- Multi-trait comparison: forest plot + comparative table ----
+                col_sort, col_bars = st.columns([3, 2])
+                sort_by = col_sort.radio("Sort by", H2_SORTS, horizontal=True, key="h2_sort", persist_state="page")
+                bars = col_bars.radio(
+                    "Error bars", ["95% CI (± 1.96 SE)", "± 1 SE"], horizontal=True, key="h2_bars", persist_state="page"
+                )
+                if plot_df.empty:
+                    st.info("No trait of this selection has a plottable estimate on this scale.")
+                else:
+                    n_sig = int(plot_df["Significant"].sum())
+                    st.caption(
+                        f"{len(plot_df)} traits · blue = BH FDR < {fdr_alpha:g} across the traits shown "
+                        f"({n_sig} of {len(plot_df)}), one-sided P for h² > 0 · dashed line: h² = 0."
+                    )
+                    st.plotly_chart(
+                        h2_forest(plot_df, h2_scale, fdr_alpha, sort_by, ci=bars.startswith("95")),
+                        key="h2_forest",
+                        alt=f"Forest plot of {h2_scale.lower()}-scale SNP heritability for {len(plot_df)} traits",
+                    )
+
+                table = h2_view.merge(plot_df[["Trait", "FDR"]], on="Trait", how="left")
+                st.caption(
+                    "Z = h² / SE (identical on both scales); one-sided P-value for h² > 0; FDR = BH across the traits "
+                    "plotted. LDSC reports h² and SE with 4 decimals, so Z and P inherit that rounding."
+                )
+                st.dataframe(
+                    table[H2_TABLE_COLUMNS + ["FDR", "Pop prev (K)", "Samp prev (P)", "Intercept", "Intercept SE", "Lambda GC", "Mean chi2", "Note"]],
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "h2 (observed)": st.column_config.NumberColumn("h² (observed)", format="%.4f"),
+                        "SE (observed)": st.column_config.NumberColumn(format="%.4f"),
+                        "h2 (liability)": st.column_config.NumberColumn("h² (liability)", format="%.4f"),
+                        "SE (liability)": st.column_config.NumberColumn(format="%.4f"),
+                        "Z": st.column_config.NumberColumn(format="%.2f"),
+                        "P-value": st.column_config.NumberColumn("P (h² > 0)", format="%.2e"),
+                        "FDR": st.column_config.NumberColumn("FDR (BH)", format="%.2e"),
+                        "Intercept": st.column_config.NumberColumn(format="%.4f"),
+                        "Intercept SE": st.column_config.NumberColumn(format="%.4f"),
+                        "Lambda GC": st.column_config.NumberColumn("λGC", format="%.4f"),
+                        "Mean chi2": st.column_config.NumberColumn("Mean χ²", format="%.4f"),
+                    },
+                )
+                st.download_button(
+                    "⬇️ Export table (TSV, incl. ratio & SNP counts)",
+                    table[H2_RESULT_COLUMNS + ["FDR"]].to_csv(sep="\t", index=False, na_rep="NA").encode("utf-8"),
+                    file_name="ldsc_h2_summary.tsv",
+                    mime="text/tab-separated-values",
+                    key="h2_download",
+                )
+            else:
+                # ---- Single trait deep-dive: metric cards, trait in panel context, LDSC checks, raw log ----
+                lookup = st.selectbox(
+                    "Target trait", h2_view["Trait"].tolist(), key="h2_lookup", persist_state="page"
+                )
+                rec = h2_view.set_index("Trait").loc[lookup]
+                if rec["Scale"] == "":
+                    st.error(f"No h² estimate for {lookup}: {rec['Note']}")
+                elif lookup not in set(plot_df["Trait"]):
+                    st.warning(f"{lookup} has no plottable estimate on the {h2_scale.lower()} scale; switch the scale above.")
+                else:
+                    target = plot_df.set_index("Trait").loc[lookup]
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric(f"h² ({h2_scale.lower()} scale)", f"{target['h2']:.4f}")
+                    c2.metric("SE", f"{target['SE']:.4f}")
+                    c3.metric("Z (h² / SE)", f"{target['Z']:.2f}")
+                    c4.metric("P-value (h² > 0)", format_p(target["P-value"]))
+                    c5.metric(
+                        "Intercept",
+                        f"{target['Intercept']:.4f}",
+                        "fixed" if pd.isna(target["Intercept SE"]) else f"SE {target['Intercept SE']:.4f}",
+                        delta_color="off",
+                    )
+                    params = [
+                        f"95% CI {target['CI low']:.4f} to {target['CI high']:.4f}",
+                        f"λGC {target['Lambda GC']:.4f}",
+                    ]
+                    if rec["Scale"] == "Liability":
+                        params.append(
+                            f"liability scale with population prevalence K = {rec['Pop prev (K)']:g}, "
+                            f"sample prevalence P = {rec['Samp prev (P)']:g} · observed-scale h² "
+                            f"{rec['h2 (observed)']:.4f} (SE {rec['SE (observed)']:.4f})"
+                        )
+                    else:
+                        params.append("observed scale (no prevalences)")
+                    st.caption(" · ".join(params))
+
+                    st.plotly_chart(
+                        h2_forest(plot_df, h2_scale, fdr_alpha, "h² (descending)", ci=True, highlight=lookup),
+                        key="h2_context",
+                        alt=f"{lookup} SNP heritability with 95% CI among {len(plot_df)} selected traits",
+                    )
+                    if len(plot_df) == 1:
+                        st.caption("Select more traits above to see this trait in the context of others.")
+
+                    st.markdown("**LDSC diagnostic checks**")
+                    st.dataframe(h2_ldsc_checks(target, h2_scale), hide_index=True, width="stretch")
+                    st.caption(
+                        "Benchmarks from the LDSC wiki (github.com/bulik/ldsc/wiki: FAQ; Heritability and Genetic "
+                        "Correlation). LDSC defines no minimum h² Z-score."
+                    )
+
+                with st.expander(f"📄 Raw LDSC log — {lookup}"):
+                    raw_log = H2_DIR / f"{lookup}.log"
+                    st.caption(f"`{raw_log.relative_to(ROOT).as_posix()}`")
+                    st.code(raw_log.read_text(encoding="utf-8", errors="replace"), language="log", height=400)

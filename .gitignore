@@ -30,8 +30,15 @@ data/methylation/*
 !data/methylation/RNA_m6A_SNPlist.txt
 
 # Generated outputs & Slurm logs
+# (covers results/munged/, results/ldsc_rg/, results/ldsc_h2/ incl. stdout/ and h2_summary.tsv,
+#  results/.cache/, and logs/runs/ app & controller logs)
 results/
 logs/
+
+# Local test runs & scratch: ad-hoc LDSC outputs at the repo root, scratch folders
+/*.log
+scratch/
+tmp/
 
 # Python cache, API caches & temporary files
 __pycache__/
@@ -71,5 +78,7 @@ Thumbs.db
 # Allow small schema/header sample files if you create a 'schemas/' folder later
 !schemas/*.txt
 
-# Local machine-specific overrides (never commit to git/HPC)
+# Local machine-specific overrides (never commit to git/HPC), incl. temporary copies
 config_local.yaml
+config_local*.yaml
+*.dryrun_bak
