@@ -346,20 +346,44 @@ def load_multiomics(dna_mtime: float, rna_mtime: float) -> pd.DataFrame:
 def trait_sharing_filter(df: pd.DataFrame, key: str) -> pd.DataFrame:
     """Count presence among user-selected traits and keep SNPs present in >= N of them."""
     all_traits = sorted({t for traits in df["TRAIT_LIST"] for t in traits})
+
+    # A keyed multiselect keeps its value across reruns, so traits that first appear after a
+    # new run (or a renamed trait) would silently stay unselected and every SNP carrying them
+    # would be under-counted. Select newly seen traits; keep the user's deselections.
+    traits_key, known_key = f"{key}_traits", f"{key}_known_traits"
+    if traits_key in st.session_state:
+        previously_known = set(st.session_state.get(known_key, all_traits))
+        kept = {t for t in st.session_state[traits_key] if t in all_traits}
+        st.session_state[traits_key] = sorted(kept | (set(all_traits) - previously_known))
+    else:
+        st.session_state[traits_key] = all_traits
+    st.session_state[known_key] = all_traits
+
     selected = set(st.multiselect(
         "Traits to count",
         all_traits,
-        default=all_traits,
-        key=f"{key}_traits",
+        key=traits_key,
         help="Traits with at least one BH-significant SNP in the latest run.",
     ))
-    max_n = max(len(selected), 1)
-    min_n = (
-        st.slider("Present in ≥ N selected traits", 1, max_n, 1, key=f"{key}_min_n")
-        if max_n > 1
-        else 1
-    )
+    not_counted = [t for t in all_traits if t not in selected]
+    if not_counted:
+        st.caption(
+            f"Counting {len(selected)} of {len(all_traits)} traits. Not counted in "
+            f"**N traits (selected)**: {', '.join(not_counted)}."
+        )
+
     n_selected = df["TRAIT_LIST"].map(lambda traits: len(selected.intersection(traits)))
+    # Upper bound = highest count any SNP reaches, so every slider position can return rows
+    max_n = max(int(n_selected.max()) if len(n_selected) else 0, 1)
+    slider_key = f"{key}_min_n"
+    if max_n > 1:
+        if slider_key in st.session_state:
+            st.session_state[slider_key] = min(max(int(st.session_state[slider_key]), 1), max_n)
+            min_n = st.slider("Present in ≥ N selected traits", 1, max_n, key=slider_key)
+        else:
+            min_n = st.slider("Present in ≥ N selected traits", 1, max_n, 1, key=slider_key)
+    else:
+        min_n = 1
     return df.assign(N_SELECTED=n_selected)[n_selected >= min_n]
 
 
