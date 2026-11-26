@@ -60,9 +60,11 @@ dna:
 # Track B: RNA Methylation (RNA m6A SNP List)
 rna:
   snp_list: "data/methylation/RNA_m6A_SNPlist.txt"
-  # Step B2: genes each BH-significant SNP falls inside (Ensembl VEP REST; GRCh37 matches the
-  # hg19 coordinates of Track A). Use "https://rest.ensembl.org" (and a new cache file) for GRCh38.
-  ensembl_server: "https://grch37.rest.ensembl.org"
+  # Step B2: GENCODE V19 genes each BH-significant SNP falls inside, via the UCSC Genome Browser
+  # REST API on hg19 (= GRCh37, matching Track A); rsID positions from UCSC's dbSNP tracks.
+  # The key keeps its historical name. The cache also holds SNPs annotated earlier by Ensembl VEP
+  # (grch37.rest.ensembl.org, down since 2026-11-25); they are reused as-is.
+  ensembl_server: "https://api.genome.ucsc.edu"
   ensembl_cache_file: "results/.cache/ensembl_grch37_genes_cache.json"
 
 # GTEx v10 Brain eQTL Lookup Parameters (13 Brain Regions, Track A only)

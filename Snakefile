@@ -5,7 +5,7 @@
 # Targets:
 #   all : Track A (DNA methylation) + Track B (RNA methylation)
 #   dna : Track A only -> results/dna/pleiotropy_dna.tsv
-#   rna : Track B only -> results/rna/pleiotropy_rna.tsv (with Ensembl GRCh37 overlapping genes)
+#   rna : Track B only -> results/rna/pleiotropy_rna.tsv (with GENCODE V19 hg19 overlapping genes, UCSC REST API)
 #   munge : LDSC munge_sumstats.py -> results/munged/{trait}.sumstats.gz
 #   rg    : LDSC genetic correlation for the pairs in config `rg`
 #           -> results/ldsc_rg/{trait1}__{trait2}.log + results/ldsc_rg/rg_summary.tsv
@@ -350,7 +350,7 @@ rule overlap_rna_m6a:
         """
 
 # ------------------------------------------------------------------------------
-# Step B2: Ensembl Genes Overlapping the BH-Significant RNA m6A SNPs (All Traits)
+# Step B2: GENCODE V19 Genes Overlapping the BH-Significant RNA m6A SNPs (UCSC hg19, All Traits)
 # ------------------------------------------------------------------------------
 rule annotate_rna_genes:
     input:
@@ -358,7 +358,7 @@ rule annotate_rna_genes:
     output:
         "results/rna/rna_sig_genes.tsv"
     params:
-        server=config["rna"].get("ensembl_server", "https://grch37.rest.ensembl.org"),
+        server=config["rna"].get("ensembl_server", "https://api.genome.ucsc.edu"),
         cache_file=config["rna"].get("ensembl_cache_file", "results/.cache/ensembl_grch37_genes_cache.json")
     shell:
         """

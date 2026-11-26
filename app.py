@@ -97,7 +97,7 @@ COLUMN_CONFIG = {
     "CONCORDANT": st.column_config.CheckboxColumn("Concordant"),
     "CONCORDANT_GENES": st.column_config.TextColumn("Concordant gene(s)"),
     "GENES": st.column_config.TextColumn(
-        "Gene(s) (Ensembl, overlapping)", help="Ensembl GRCh37 genes whose transcripts the SNP falls inside"
+        "Gene(s) (GENCODE V19, overlapping)", help="GENCODE V19 genes (hg19/GRCh37) whose transcripts the SNP falls inside"
     ),
     "CPG_GENES_5KB": st.column_config.TextColumn("CpG gene(s) (TSS ≤ 5 kb)"),
     "GTEX_BRAIN_GENES": st.column_config.TextColumn("GTEx brain eQTL gene(s)"),
@@ -971,7 +971,7 @@ with st.sidebar:
 st.title("🧬 Methylation × GWAS Pleiotropy Explorer")
 st.caption(
     "DNA ASM tag SNPs & LD proxies → CpG gene (TSS ≤ 5 kb) vs. GTEx v10 brain eQTL concordance · "
-    "RNA m6A SNPs → overlapping Ensembl genes (GRCh37) · BH FDR 5% per trait"
+    "RNA m6A SNPs → overlapping GENCODE V19 genes (hg19) · BH FDR 5% per trait"
 )
 
 st.fragment(run_monitor, run_every=3 if run_active else None)()
@@ -1022,7 +1022,7 @@ with tab_rna:
         missing_results("RNA", "RNA Methylation Only")
     else:
         if "GENES" not in rna_df.columns:
-            st.info("This RNA table predates the Ensembl gene step. Re-run **RNA Methylation Only** to add the gene column.")
+            st.info("This RNA table predates the gene annotation step. Re-run **RNA Methylation Only** to add the gene column.")
             rna_df = rna_df.assign(GENES="")
         col_filters, col_search = st.columns([3, 2])
         with col_filters:
