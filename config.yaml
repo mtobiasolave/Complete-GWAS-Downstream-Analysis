@@ -57,14 +57,20 @@ dna:
   # Tags absent from a GWAS: "best_ld_proxy" tests them via their highest-LD_R2 proxy, "none" skips them
   tag_fallback: "best_ld_proxy"
 
+# Track B Step B2 gene annotation source (genes each BH-significant RNA m6A SNP falls inside, hg19/GRCh37):
+#   "ucsc"    = UCSC Genome Browser REST API, hg19, GENCODE V19 tracks, rsID positions from UCSC dbSNP (default)
+#   "ensembl" = Ensembl VEP REST API on the GRCh37 server
+# The app sets it per run (CLI: --config rna_gene_source=ensembl). Switching re-runs only
+# annotate_rna_genes and pleiotropy_rna; each source keeps its own cache below.
+rna_gene_source: "ucsc"
+
 # Track B: RNA Methylation (RNA m6A SNP List)
 rna:
   snp_list: "data/methylation/RNA_m6A_SNPlist.txt"
-  # Step B2: GENCODE V19 genes each BH-significant SNP falls inside, via the UCSC Genome Browser
-  # REST API on hg19 (= GRCh37, matching Track A); rsID positions from UCSC's dbSNP tracks.
-  # The key keeps its historical name. The cache also holds SNPs annotated earlier by Ensembl VEP
-  # (grch37.rest.ensembl.org, down since 2026-11-25); they are reused as-is.
-  ensembl_server: "https://api.genome.ucsc.edu"
+  # Step B2 servers and caches, one cache per source so annotations never mix
+  ucsc_server: "https://api.genome.ucsc.edu"
+  ucsc_cache_file: "results/.cache/ucsc_hg19_genes_cache.json"
+  ensembl_server: "https://grch37.rest.ensembl.org"
   ensembl_cache_file: "results/.cache/ensembl_grch37_genes_cache.json"
 
 # GTEx v10 Brain eQTL Lookup Parameters (13 Brain Regions, Track A only)

@@ -86,6 +86,12 @@ ENGINES = {
     "Local (Direct Snakemake)": "local",
     "HPC (Slurm / sbatch)": "slurm",
 }
+# Step B2 gene annotation source (Snakemake config `rna_gene_source`)
+RNA_GENE_SOURCES = {
+    "UCSC Genome Browser (hg19 / GENCODE v19)": "ucsc",
+    "Ensembl REST API (GRCh37)": "ensembl",
+}
+RNA_GENES_TABLE = ROOT / "results" / "rna" / "rna_sig_genes.tsv"
 PROGRESS_RE = re.compile(r"(\d+) of (\d+) steps \((\d+(?:\.\d+)?)%\) done")
 IS_WINDOWS = os.name == "nt"
 
@@ -97,7 +103,9 @@ COLUMN_CONFIG = {
     "CONCORDANT": st.column_config.CheckboxColumn("Concordant"),
     "CONCORDANT_GENES": st.column_config.TextColumn("Concordant gene(s)"),
     "GENES": st.column_config.TextColumn(
-        "Gene(s) (GENCODE V19, overlapping)", help="GENCODE V19 genes (hg19/GRCh37) whose transcripts the SNP falls inside"
+        "Gene(s) (overlapping)",
+        help="hg19/GRCh37 genes whose transcripts the SNP falls inside, from the RNA gene annotation source "
+        "of the run (UCSC GENCODE V19 or Ensembl GRCh37)",
     ),
     "CPG_GENES_5KB": st.column_config.TextColumn("CpG gene(s) (TSS ≤ 5 kb)"),
     "GTEX_BRAIN_GENES": st.column_config.TextColumn("GTEx brain eQTL gene(s)"),
@@ -320,6 +328,18 @@ def load_pleiotropy(path: str, mtime: float) -> pd.DataFrame:
 
 def table_or_none(path: Path):
     return load_pleiotropy(str(path), path.stat().st_mtime) if path.exists() else None
+
+
+@st.cache_data(show_spinner=False)
+def rna_annotation_sources(path: str, mtime: float) -> list:
+    """(annotation source, SNP count) pairs of rna_sig_genes.tsv, from its ENSEMBL_RELEASE column
+    ('UCSC hg19 GENCODE V19 + <dbSNP track>' or an Ensembl release number)."""
+    try:
+        releases = pd.read_csv(path, sep="\t", usecols=["ENSEMBL_RELEASE"], dtype=str)["ENSEMBL_RELEASE"]
+    except (OSError, ValueError):
+        return []
+    labels = releases.fillna("NA").map(lambda r: r if r.startswith("UCSC") else f"Ensembl GRCh37 release {r}")
+    return list(labels.value_counts().items())
 
 
 @st.cache_data(show_spinner=False)
@@ -931,6 +951,19 @@ with st.sidebar:
         help=f"Summary statistics found in `{config.get('raw_data_dir', 'data/raw_data')}/`.",
     )
     mode_label = st.radio("Target mode", list(TARGET_MODES))
+    run_extra_config = []
+    if TARGET_MODES[mode_label] in ("all", "rna"):
+        source_values = list(RNA_GENE_SOURCES.values())
+        configured_source = str(config.get("rna_gene_source") or "ucsc").strip().lower()
+        rna_source_label = st.selectbox(
+            "RNA gene annotation source",
+            list(RNA_GENE_SOURCES),
+            index=source_values.index(configured_source) if configured_source in source_values else 0,
+            key="rna_gene_source",
+            help="Database used to find the genes each BH-significant RNA m6A SNP falls inside (hg19/GRCh37). "
+            "Each source keeps its own cache; switching re-runs only the gene annotation and the RNA summary.",
+        )
+        run_extra_config.append(f"rna_gene_source={RNA_GENE_SOURCES[rna_source_label]}")
 
     has_sbatch = shutil.which("sbatch") is not None
     engine_label = st.radio(
@@ -952,7 +985,7 @@ with st.sidebar:
     launch_blocked = run_active or not selected_traits or (engine == "slurm" and not has_sbatch)
     if st.button("🚀 Run pipeline", type="primary", disabled=launch_blocked, width="stretch"):
         try:
-            start_run(TARGET_MODES[mode_label], selected_traits, engine, int(cores))
+            start_run(TARGET_MODES[mode_label], selected_traits, engine, int(cores), extra_config=run_extra_config)
             st.rerun()
         except (OSError, subprocess.CalledProcessError) as exc:
             detail = getattr(exc, "stderr", "") or str(exc)
@@ -971,7 +1004,7 @@ with st.sidebar:
 st.title("🧬 Methylation × GWAS Pleiotropy Explorer")
 st.caption(
     "DNA ASM tag SNPs & LD proxies → CpG gene (TSS ≤ 5 kb) vs. GTEx v10 brain eQTL concordance · "
-    "RNA m6A SNPs → overlapping GENCODE V19 genes (hg19) · BH FDR 5% per trait"
+    "RNA m6A SNPs → overlapping genes (hg19/GRCh37: UCSC GENCODE V19 or Ensembl) · BH FDR 5% per trait"
 )
 
 st.fragment(run_monitor, run_every=3 if run_active else None)()
@@ -1032,6 +1065,10 @@ with tab_rna:
         rna_view = search_filter(rna_view, rna_query, ["SNP", "GENES"])
 
         st.metric("SNPs shown", f"{len(rna_view):,}", f"of {len(rna_df):,}", delta_color="off")
+        if RNA_GENES_TABLE.exists():
+            sources = rna_annotation_sources(str(RNA_GENES_TABLE), RNA_GENES_TABLE.stat().st_mtime)
+            if sources:
+                st.caption("Gene annotation source: " + "; ".join(f"{label} ({n:,} SNPs)" for label, n in sources))
         show_table(
             rna_view,
             ["SNP", "GENES", "N_SELECTED", "TRAITS_PRESENT", "MIN_FDR_BH"],
