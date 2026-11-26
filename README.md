@@ -20,7 +20,7 @@ GWAS summary statistics (data/raw_data/*_gwas.txt)
   │
   ├──► Track B: RNA Methylation (RNA m6A SNP list)
   │      B1 overlap_rna_m6a.py         Overlap reference SNPs with GWAS + BH FDR 5%
-  │      B2 annotate_rna_genes.py      Ensembl GRCh37 genes each significant SNP falls inside (VEP REST)
+  │      B2 annotate_rna_genes.py      Genes each significant SNP falls inside (UCSC hg19 GENCODE V19 or Ensembl GRCh37)
   │      B3 pleiotropy.py --mode rna   results/rna/pleiotropy_rna.tsv
   │
   ├──► Munging (target `munge`, independent of both tracks)
@@ -40,8 +40,8 @@ A SNP is *present* in a trait when it is BH-significant in that trait. The pleio
 | Output | Columns |
 |---|---|
 | `results/dna/pleiotropy_dna.tsv` | `SNP, N_TRAITS, TRAITS_PRESENT, CONCORDANT, CONCORDANT_GENES, CPG_GENES_5KB, GTEX_BRAIN_GENES, CPG_IDS, GTEX_TISSUES, MIN_FDR_BH` |
-| `results/rna/pleiotropy_rna.tsv` | `SNP, GENES, N_TRAITS, TRAITS_PRESENT, MIN_FDR_BH` (`GENES`: overlapping Ensembl genes, or `intergenic` / `not in Ensembl` / `no primary-assembly locus`) |
-| `results/rna/rna_sig_genes.tsv` | One row per BH-significant RNA m6A SNP: `SNP, GENES, ENSEMBL_GENE_IDS, STATUS, CHR, POS` (GRCh37), `CONSEQUENCES, TRANSCRIPT_BIOTYPES, ENSEMBL_RELEASE` |
+| `results/rna/pleiotropy_rna.tsv` | `SNP, GENES, N_TRAITS, TRAITS_PRESENT, MIN_FDR_BH` (`GENES`: overlapping genes, or `intergenic` / `no primary-assembly locus` / `not in dbSNP` (UCSC) / `not in Ensembl` (Ensembl)) |
+| `results/rna/rna_sig_genes.tsv` | One row per BH-significant RNA m6A SNP: `SNP, GENES, ENSEMBL_GENE_IDS, STATUS, CHR, POS` (hg19/GRCh37, 1-based), `CONSEQUENCES, TRANSCRIPT_BIOTYPES, ENSEMBL_RELEASE` (annotation source: `UCSC hg19 GENCODE V19 + <dbSNP track>`, or the Ensembl release number); same columns for both sources |
 | `results/dna/{trait}_overlap_all.tsv` | Every mapping row (tag + LD proxies) of each tested tag with the tag-level `GWAS_P, GWAS_BETA, GWAS_FDR_BH, BH_SIGNIFICANT, TESTED_SNP` and row-level `LD_R2, QUERY_IN_GWAS, QUERY_GWAS_P, QUERY_GWAS_BETA` |
 | `results/rna/{trait}_overlap_bh.tsv` | Every overlapping RNA m6A SNP with the same BH columns |
 | `results/ldsc_rg/rg_summary.tsv` | `Trait 1, Trait 2, rg, SE, Z, P-value, FDR`, h2 per trait, `gcov_int`, `Note` (why rg is NA) |
@@ -110,7 +110,7 @@ The `munge`, `rg` and `h2` targets also need the sibling LDSC repository (see [L
 ```bash
 streamlit run app.py
 ```
-**Methylation tabs:** select traits, target mode (Both / DNA only / RNA only) and execution engine (Local or HPC; HPC is preselected when `sbatch` is available), then press **Run pipeline**. The run continues in the background; the app shows live progress and the log, and refreshes the result tables when it finishes. The RNA tab lists each SNP's overlapping Ensembl gene(s) and can be searched by rsID or gene. On the HPC, open the app through SSH port forwarding, e.g. `ssh -L 8502:localhost:8502 user@cluster`.
+**Methylation tabs:** select traits, target mode (Both / DNA only / RNA only) and execution engine (Local or HPC; HPC is preselected when `sbatch` is available), then press **Run pipeline**. The run continues in the background; the app shows live progress and the log, and refreshes the result tables when it finishes. For RNA runs, **RNA gene annotation source** selects UCSC Genome Browser (hg19 / GENCODE v19, default) or Ensembl REST API (GRCh37). The RNA tab lists each SNP's overlapping gene(s), shows which source annotated the table, and can be searched by rsID or gene. On the HPC, open the app through SSH port forwarding, e.g. `ssh -L 8502:localhost:8502 user@cluster`.
 
 **🧹 Munge Sumstats tab:** select unmunged traits (or tick *Include already munged traits* to re-munge), check the reference alleles file and the per-trait sample size (manual N > N column override > detected N column; the resolved LDSC flags are shown), then press **Run Munging**. Each trait shows Queued / Running / Done with a live log viewer, and the inventory lists `results/munged/` with size, date, SNPs with Z, mean χ² and λGC, plus file previews.
 
@@ -183,6 +183,10 @@ LDSC prints either the observed or the liability estimate; for liability runs th
 
 ### Notes
 - Step A3 queries the GTEx Portal API and needs outbound internet access on the node that runs it. Results are cached in `results/.cache/gtex_eqtl_cache.json`; failed requests are not cached and make the job fail so it can be retried.
-- Step B2 queries the Ensembl VEP REST API (`rna.ensembl_server`, GRCh37 by default to match Track A's hg19 coordinates) and also needs internet access. A gene is reported when the SNP falls inside one of its transcripts (any biotype); genes VEP reports only as up/downstream (≤ 5 kb) are excluded. Results are cached in `results/.cache/ensembl_grch37_genes_cache.json`; failed requests are not cached and make the job fail. Use a different cache file if you switch server/assembly.
+- Step B2 needs internet access and has two sources (config `rna_gene_source`, set per run by the app or `--config rna_gene_source=ensembl`); both report a gene when the SNP falls inside one of its transcripts (any biotype, up/downstream genes excluded) and write the same columns (`--source` of `scripts/annotate_rna_genes.py`; backends in `scripts/rna_genes_ucsc.py` / `scripts/rna_genes_ensembl.py`, shared network code in `scripts/rna_genes_common.py`):
+  - `ucsc` (default): UCSC Genome Browser REST API (`rna.ucsc_server`, hg19 to match Track A). Each rsID is placed with UCSC's newest dbSNP track (dbSnp155); genes come from the GENCODE V19 tracks `wgEncodeGencodeCompV19` + `wgEncodeGencodePseudoGeneV19`, gene IDs and biotypes from UCSC's `wgEncodeGencodeAttrsV19` table (downloaded once, ~4.5 MB). Requests are paced at about one per second (UCSC's usage limit), so a cold run of ~1,500 SNPs takes about an hour.
+  - `ensembl`: Ensembl VEP REST API (`rna.ensembl_server`, GRCh37 server), batches of 25 rsIDs, 2 concurrent requests.
+  - Each source has its own cache (`rna.ucsc_cache_file` = `results/.cache/ucsc_hg19_genes_cache.json` + `ucsc_hg19_rsid_positions.json`; `rna.ensembl_cache_file` = `results/.cache/ensembl_grch37_genes_cache.json`); records of the other source found in a cache are moved to that source's file, so annotations never mix. Switching source re-runs only `annotate_rna_genes` and `pleiotropy_rna`, and re-runs only query uncached SNPs. Both ignore proxy environment variables unless the direct connection fails, check the server first (an outage fails fast), retry with backoff, and never cache failed requests (the job fails so a re-run retries only them).
+  - Tests: `python -m unittest discover -s tests` (set `RUN_LIVE_UCSC=1` / `RUN_LIVE_ENSEMBL=1` to add the live API checks).
 - `config_local.yaml` overrides `config.yaml` whenever it is present; do not copy it to the HPC unless you want its trait subset there.
 - Always run the pipeline and the app from the **activated** `snakemake9_env` (`conda activate snakemake9_env` or `conda run -n snakemake9_env ...`). Calling the environment's `python.exe` directly on Windows leaves its DLL folder off `PATH`, and LDSC regressions (`rg`, `h2`) then crash in NumPy's linear algebra with `Windows fatal exception: code 0xc06d007f`.

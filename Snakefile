@@ -5,7 +5,7 @@
 # Targets:
 #   all : Track A (DNA methylation) + Track B (RNA methylation)
 #   dna : Track A only -> results/dna/pleiotropy_dna.tsv
-#   rna : Track B only -> results/rna/pleiotropy_rna.tsv (with Ensembl GRCh37 overlapping genes)
+#   rna : Track B only -> results/rna/pleiotropy_rna.tsv (with overlapping hg19/GRCh37 genes; config rna_gene_source)
 #   munge : LDSC munge_sumstats.py -> results/munged/{trait}.sumstats.gz
 #   rg    : LDSC genetic correlation for the pairs in config `rg`
 #           -> results/ldsc_rg/{trait1}__{trait2}.log + results/ldsc_rg/rg_summary.tsv
@@ -350,19 +350,32 @@ rule overlap_rna_m6a:
         """
 
 # ------------------------------------------------------------------------------
-# Step B2: Ensembl Genes Overlapping the BH-Significant RNA m6A SNPs (All Traits)
+# Step B2: Genes Overlapping the BH-Significant RNA m6A SNPs (hg19/GRCh37, All Traits)
+# Source (config rna_gene_source): "ucsc" = UCSC REST API, GENCODE V19 (default);
+# "ensembl" = Ensembl VEP REST, GRCh37. Each source has its own server and cache
+# (config rna.{source}_server / rna.{source}_cache_file).
 # ------------------------------------------------------------------------------
+RNA_GENE_SOURCE = str(config.get("rna_gene_source") or "ucsc").strip().lower()
+if RNA_GENE_SOURCE not in ("ucsc", "ensembl"):
+    raise ValueError(f"config rna_gene_source must be 'ucsc' or 'ensembl', not {config.get('rna_gene_source')!r}")
+RNA_GENE_DEFAULTS = {
+    "ucsc": ("https://api.genome.ucsc.edu", "results/.cache/ucsc_hg19_genes_cache.json"),
+    "ensembl": ("https://grch37.rest.ensembl.org", "results/.cache/ensembl_grch37_genes_cache.json"),
+}
+
 rule annotate_rna_genes:
     input:
         expand("results/rna/{trait}_overlap_bh.tsv", trait=TRAITS)
     output:
         "results/rna/rna_sig_genes.tsv"
     params:
-        server=config["rna"].get("ensembl_server", "https://grch37.rest.ensembl.org"),
-        cache_file=config["rna"].get("ensembl_cache_file", "results/.cache/ensembl_grch37_genes_cache.json")
+        source=RNA_GENE_SOURCE,
+        server=config["rna"].get(f"{RNA_GENE_SOURCE}_server", RNA_GENE_DEFAULTS[RNA_GENE_SOURCE][0]),
+        cache_file=config["rna"].get(f"{RNA_GENE_SOURCE}_cache_file", RNA_GENE_DEFAULTS[RNA_GENE_SOURCE][1])
     shell:
         """
         {PYTHON} scripts/annotate_rna_genes.py \
+            --source {params.source} \
             --inputs {input} \
             --output {output} \
             --server {params.server} \
